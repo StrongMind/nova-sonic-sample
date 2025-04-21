@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Nova Sonic Audio Stream</title>
+  <%= csrf_meta_tags %>
+  <%= csp_meta_tag %>
+  <%= stylesheet_link_tag "application" %>
+  <%= javascript_importmap_tags %>
+
+  <%= javascript_tag nonce: true do %>
+    window.sessionId = '<%= @session_id %>';
+  <% end %>
+</head>
+
+<body>
+  <div class="container">
+    <h1>Nova Sonic Audio Stream</h1>
+    
+    <div class="status" id="connectionStatus">
+      Connecting...
+    </div>
+
+    <div class="controls">
+      <button id="startButton" disabled>Start Recording</button>
+      <button id="stopButton" disabled>Stop Recording</button>
+    </div>
+
+    <div class="chat-history" id="chatHistory">
+      <!-- Chat messages will be inserted here -->
+    </div>
+  </div>
+
+  <%= javascript_import_module_tag "channels/audio_stream" %>
+</body>
+</html> 
