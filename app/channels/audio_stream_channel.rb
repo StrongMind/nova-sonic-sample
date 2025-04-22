@@ -12,7 +12,13 @@ class AudioStreamChannel < ApplicationCable::Channel
       logger.info "<<< Transmitted confirm_subscription for #{@session_id} >>>"
       
       # Initialize Nova Sonic client and session
-      setup_nova_sonic_session
+      begin
+        setup_nova_sonic_session
+      rescue => e
+        logger.error "Failed to setup Nova Sonic session: #{e.message}"
+        logger.error e.backtrace.join("\n")
+        transmit({ type: 'error', message: 'Failed to initialize speech service', details: e.message })
+      end
     else
       logger.error "Rejected subscription: missing session_id"
       reject_subscription # Reject if no session ID
@@ -62,7 +68,7 @@ class AudioStreamChannel < ApplicationCable::Channel
       @session&.end_prompt
     when 'system_prompt'
       logger.info "Processing system_prompt for session #{@session_id}"
-      transmit({ type: 'error', message: 'System prompt not yet implemented' })
+      setup_system_prompt(message_data['content'])
     when 'audio_start'
       logger.info "Processing audio_start for session #{@session_id}"
       if @session.nil?
@@ -70,6 +76,7 @@ class AudioStreamChannel < ApplicationCable::Channel
         transmit({ type: 'error', message: 'No active session' })
         return
       end
+      setup_audio_start
       transmit({ type: 'audio_started', message: 'Audio streaming initialized' })
     when 'audio_input'
       if message_data['audio_data'].present?
@@ -102,17 +109,79 @@ class AudioStreamChannel < ApplicationCable::Channel
   private
 
   def setup_nova_sonic_session
-    @nova_sonic_client = NovaSonicBidirectionalStreamClient.new(
-      region: 'us-east-1',
-      credentials: {
-        access_key_id: ENV['AWS_ACCESS_KEY_ID'],
-        secret_access_key: ENV['AWS_SECRET_ACCESS_KEY']
-      }
-    )
+    # Add credential validation logging
+    aws_credentials = {
+      access_key_id: ENV['AWS_ACCESS_KEY_ID'],
+      secret_access_key: ENV['AWS_SECRET_ACCESS_KEY'],
+      session_token: ENV['AWS_SESSION_TOKEN']
+    }
     
-    @session = @nova_sonic_client.create_stream_session(@session_id)
-    setup_event_handlers
+    # Check if credentials are present
+    logger.info "AWS Access Key ID present: #{aws_credentials[:access_key_id].present?}"
+    logger.info "AWS Secret Access Key present: #{aws_credentials[:secret_access_key].present?}"
+    logger.info "AWS Session Token present: #{aws_credentials[:session_token].present?}"
+    
+    if aws_credentials[:session_token].present?
+      # If using session token, verify token expiration if possible
+      begin
+        # Dummy STS call to verify credentials (optional)
+        require 'aws-sdk-core'
+        sts = Aws::STS::Client.new(region: 'us-east-1', credentials: Aws::Credentials.new(
+          aws_credentials[:access_key_id],
+          aws_credentials[:secret_access_key],
+          aws_credentials[:session_token]
+        ))
+        identity = sts.get_caller_identity
+        logger.info "AWS credentials validated successfully. Account: #{identity.account}, ARN: #{identity.arn}"
+      rescue StandardError => e
+        logger.warn "AWS credential validation failed: #{e.message}"
+        transmit({ type: 'error', message: 'AWS credentials may have expired', details: e.message })
+        raise "AWS credentials validation error: #{e.message}"
+      end
+    end
+    
+    # Create client with a rescue block to catch initialization errors
+    begin
+      @nova_sonic_client = NovaSonicBidirectionalStreamClient.new(
+        region: 'us-east-1',
+        credentials: aws_credentials
+      )
+      
+      @session = @nova_sonic_client.create_stream_session(@session_id)
+      setup_event_handlers
+      initialize_nova_sonic_session
+      @nova_sonic_client.initiate_session(@session_id)
+    rescue => e
+      logger.error "Error initializing Nova Sonic client: #{e.message}"
+      logger.error e.backtrace.join("\n")
+      transmit({ type: 'error', message: 'Failed to initialize speech service', details: e.message })
+      raise
+    end
+  end
+  
+  def initialize_nova_sonic_session
+    # With our updated initiate_session function, these calls are no longer necessary here
+    # The initiate_session method will call these in the correct order
+    # The only thing we need to do is initiate the session
     @nova_sonic_client.initiate_session(@session_id)
+  end
+  
+  def setup_system_prompt(content)
+    return unless @session
+    
+    # If a custom system prompt is provided, send it
+    if content.present?
+      @nova_sonic_client.setup_system_prompt_event(@session_id, nil, content)
+      transmit({ type: 'system_prompt_set', message: 'System prompt configured' })
+    else
+      transmit({ type: 'error', message: 'Empty system prompt content' })
+    end
+  end
+  
+  def setup_audio_start
+    return unless @session
+    
+    @nova_sonic_client.setup_start_audio_event(@session_id)
   end
 
   def setup_event_handlers
@@ -147,6 +216,10 @@ class AudioStreamChannel < ApplicationCable::Channel
     begin
       logger.info "Processing audio data for session #{@session_id}"
       
+      # Log incoming data format/size
+      logger.debug "Raw audio data length: #{audio_data.length} characters"
+      logger.debug "Audio data format check: starts with data:audio prefix? #{audio_data.start_with?('data:audio') ? 'yes' : 'no'}"
+      
       # Convert base64 string to binary data
       audio_buffer = Base64.decode64(audio_data)
       
@@ -159,8 +232,38 @@ class AudioStreamChannel < ApplicationCable::Channel
         return
       end
       
-      logger.debug "Streaming #{audio_buffer.size} bytes of audio data for session #{@session_id}"
-      @session.stream_audio(audio_buffer)
+      # Further analysis of the decoded buffer
+      logger.debug "Streaming #{audio_buffer.size} bytes of audio data"
+      logger.debug "Audio buffer first 16 bytes: #{audio_buffer[0..15].unpack('C*')}" rescue "Unable to unpack buffer"
+      
+      # We'll transmit a processing notification to let the client know we're handling the audio
+      transmit({
+        type: 'audio_processing',
+        message: 'Processing audio data',
+        size: audio_buffer.size
+      })
+      
+      # Stream the audio data to AWS
+      begin
+        # For this debugging session, let's log the format used in the example
+        logger.debug "Using audio format: audio/lpcm, 16kHz, 16-bit, mono"
+        
+        # Stream the audio data
+        @session.stream_audio(audio_buffer)
+        logger.debug "Audio data successfully sent to streaming session"
+      rescue => stream_error
+        logger.error "Error streaming audio to session: #{stream_error.message}"
+        logger.error stream_error.backtrace.join("\n")
+        
+        # Close the session on error and restart
+        logger.info "Attempting to restart the session after error"
+        cleanup_nova_sonic_session
+        transmit({ 
+          type: 'error',
+          message: 'Error streaming audio to AWS, session will be reset',
+          details: stream_error.message 
+        })
+      end
       
     rescue ArgumentError => e
       logger.error "Invalid base64 audio data for session #{@session_id}: #{e.message}"
@@ -171,6 +274,7 @@ class AudioStreamChannel < ApplicationCable::Channel
       })
     rescue => e
       logger.error "Error processing audio for session #{@session_id}: #{e.message}"
+      logger.error e.backtrace.join("\n")
       transmit({ 
         type: 'error',
         message: 'Error processing audio',
