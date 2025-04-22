@@ -72,9 +72,8 @@ class AudioStreamChannel < ApplicationCable::Channel
     when 'audio_start'
       logger.info "Processing audio_start for session #{@session_id}"
       if @session.nil?
-        logger.error "No active session for audio_start"
-        transmit({ type: 'error', message: 'No active session' })
-        return
+        logger.info "No active session found for audio_start, creating new session"
+        setup_nova_sonic_session
       end
       setup_audio_start
       transmit({ type: 'audio_started', message: 'Audio streaming initialized' })
@@ -82,10 +81,21 @@ class AudioStreamChannel < ApplicationCable::Channel
       if message_data['audio_data'].present?
         logger.info "Processing audio_input for session #{@session_id}"
         if @session.nil?
-          logger.error "No active session for audio_input"
-          transmit({ type: 'error', message: 'No active session' })
-          return
+          logger.info "No active session for audio_input, attempting to recreate session"
+          begin
+            setup_nova_sonic_session
+            # Give the session a moment to initialize
+            sleep(0.5)
+            # Start audio after recreating the session
+            setup_audio_start
+            transmit({ type: 'session_recreated', message: 'Session was recreated automatically' })
+          rescue => e
+            logger.error "Failed to recreate session: #{e.message}"
+            transmit({ type: 'error', message: 'Failed to recreate session', details: e.message })
+            return
+          end
         end
+        
         # Strip the data URL prefix if present
         audio_data = message_data['audio_data']
         if audio_data.start_with?('data:')
@@ -142,20 +152,74 @@ class AudioStreamChannel < ApplicationCable::Channel
     
     # Create client with a rescue block to catch initialization errors
     begin
-      @nova_sonic_client = NovaSonicBidirectionalStreamClient.new(
-        region: 'us-east-1',
-        credentials: aws_credentials
-      )
+      # If we already have a client, try to use it
+      if @nova_sonic_client.nil?
+        @nova_sonic_client = NovaSonicBidirectionalStreamClient.new(
+          region: 'us-east-1',
+          credentials: aws_credentials
+        )
+      end
       
+      # Clean up any existing session to avoid conflicts
+      if @session
+        logger.info "Cleaning up existing session #{@session_id}"
+        begin
+          @session.close rescue nil
+        rescue => e
+          logger.warn "Error closing existing session: #{e.message}"
+        end
+        @session = nil
+      end
+      
+      # Create a new session
       @session = @nova_sonic_client.create_stream_session(@session_id)
+      
+      # Set up event handlers
       setup_event_handlers
-      initialize_nova_sonic_session
-      @nova_sonic_client.initiate_session(@session_id)
+      
+      # Initialize the session with a retry mechanism
+      initialize_with_retry(3)
     rescue => e
       logger.error "Error initializing Nova Sonic client: #{e.message}"
       logger.error e.backtrace.join("\n")
       transmit({ type: 'error', message: 'Failed to initialize speech service', details: e.message })
       raise
+    end
+  end
+  
+  def initialize_with_retry(max_retries = 3)
+    attempt = 0
+    last_error = nil
+    
+    while attempt < max_retries
+      attempt += 1
+      
+      begin
+        logger.info "Initialize session attempt #{attempt}/#{max_retries}"
+        initialize_nova_sonic_session
+        
+        # If we get here, initialization succeeded
+        logger.info "Session initialization successful on attempt #{attempt}"
+        return
+      rescue => e
+        last_error = e
+        logger.error "Error during initialization attempt #{attempt}: #{e.message}"
+        
+        # Only sleep between retries if we're going to retry
+        if attempt < max_retries
+          sleep_time = [1.0 * attempt, 3.0].min  # Backoff, but max 3 seconds
+          logger.info "Waiting #{sleep_time} seconds before retry..."
+          sleep(sleep_time)
+        end
+      end
+    end
+    
+    # If we get here, all attempts failed
+    logger.error "Failed to initialize after #{max_retries} attempts"
+    if last_error
+      logger.error "Last error: #{last_error.message}"
+      transmit({ type: 'error', message: 'Failed to initialize session after multiple attempts', details: last_error.message })
+      raise last_error
     end
   end
   
@@ -221,7 +285,14 @@ class AudioStreamChannel < ApplicationCable::Channel
       logger.debug "Audio data format check: starts with data:audio prefix? #{audio_data.start_with?('data:audio') ? 'yes' : 'no'}"
       
       # Convert base64 string to binary data
-      audio_buffer = Base64.decode64(audio_data)
+      begin
+        audio_buffer = Base64.decode64(audio_data)
+        logger.debug "Base64 decode successful, got #{audio_buffer.bytesize} bytes"
+      rescue => e
+        logger.error "Base64 decode failed: #{e.message}"
+        transmit({ type: 'error', message: 'Failed to decode audio data', details: e.message })
+        return
+      end
       
       if audio_buffer.empty?
         logger.error "Decoded audio buffer is empty for session #{@session_id}"
@@ -232,15 +303,37 @@ class AudioStreamChannel < ApplicationCable::Channel
         return
       end
       
+      # Do some basic PCM validation
+      if audio_buffer.bytesize < 44  # At least a minimal PCM header size
+        logger.warn "Audio buffer may be too small (#{audio_buffer.bytesize} bytes)"
+      end
+      
       # Further analysis of the decoded buffer
       logger.debug "Streaming #{audio_buffer.size} bytes of audio data"
-      logger.debug "Audio buffer first 16 bytes: #{audio_buffer[0..15].unpack('C*')}" rescue "Unable to unpack buffer"
+      sample_bytes = [audio_buffer[0..15].unpack('C*')].flatten.map{|b| b.to_s(16).rjust(2, '0')}.join(' ')
+      logger.debug "Audio buffer first 16 bytes (hex): #{sample_bytes}"
+      
+      # Check if the data looks like expected 16kHz, 16-bit PCM (very rough check)
+      if audio_buffer.bytesize % 2 != 0
+        logger.warn "Audio data length (#{audio_buffer.bytesize}) is not a multiple of 2 bytes - may not be 16-bit PCM"
+      end
+      
+      # Check for WAV header and skip it if present
+      if audio_buffer.bytesize >= 44 && audio_buffer[0..3] == "RIFF" && audio_buffer[8..11] == "WAVE"
+        logger.info "Found WAV header, attempting to extract PCM data"
+        
+        # Extract PCM data (skipping the WAV header)
+        data_offset = 44  # Standard WAV header size
+        audio_buffer = audio_buffer[data_offset..-1]
+        logger.info "Extracted #{audio_buffer.bytesize} bytes of PCM data from WAV"
+      end
       
       # We'll transmit a processing notification to let the client know we're handling the audio
       transmit({
         type: 'audio_processing',
         message: 'Processing audio data',
-        size: audio_buffer.size
+        size: audio_buffer.size,
+        format: 'audio/lpcm'
       })
       
       # Stream the audio data to AWS

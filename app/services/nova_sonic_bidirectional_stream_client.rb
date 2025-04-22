@@ -61,9 +61,6 @@ class NovaSonicBidirectionalStreamClient
       @session_id = session_id
       @client = client
       @is_active = true
-      @is_processing_audio = false
-      @audio_buffer_queue = []
-      @max_queue_size = 200
       @handlers = {}
       @logger = Rails.logger rescue Logger.new(STDOUT)
     end
@@ -105,65 +102,28 @@ class NovaSonicBidirectionalStreamClient
       end
     end
     
-    # Stream audio for this session
+    # Stream audio for this session - simplified to match example.rb
     def stream_audio(audio_data)
       return unless @is_active
-      
-      # Check queue size to avoid memory issues
-      if @audio_buffer_queue.length >= @max_queue_size
-        # Queue is full, drop oldest chunk
-        @audio_buffer_queue.shift
-        @logger.info "Audio queue full, dropping oldest chunk"
-      end
-      
-      # Queue the audio chunk for streaming
-      @audio_buffer_queue.push(audio_data)
-      process_audio_queue
+      client.stream_audio_chunk(session_id, audio_data)
     end
     
-    # Process audio queue for continuous streaming
-    def process_audio_queue
-      return if @is_processing_audio || @audio_buffer_queue.empty? || !@is_active
-      
-      @is_processing_audio = true
-      begin
-        # Process all chunks in the queue, up to a reasonable limit
-        processed_chunks = 0
-        max_chunks_per_batch = 5 # Process max 5 chunks at a time to avoid overload
-        
-        while !@audio_buffer_queue.empty? && processed_chunks < max_chunks_per_batch && @is_active
-          audio_chunk = @audio_buffer_queue.shift
-          if audio_chunk
-            client.stream_audio_chunk(session_id, audio_chunk)
-            processed_chunks += 1
-          end
-        end
-      ensure
-        @is_processing_audio = false
-        
-        # If there are still items in the queue, schedule the next processing
-        if !@audio_buffer_queue.empty? && @is_active
-          Thread.new { process_audio_queue }
-        end
-      end
-    end
-    
+    # Send content end
     def end_audio_content
       return unless @is_active
       client.send_content_end(session_id)
     end
     
+    # End prompt
     def end_prompt
       return unless @is_active
       client.send_prompt_end(session_id)
     end
     
+    # Close the session
     def close
       return unless @is_active
-      
       @is_active = false
-      @audio_buffer_queue.clear # Clear any pending audio
-      
       client.send_session_end(session_id)
       @logger.info "Session #{session_id} close completed"
     end
@@ -275,133 +235,200 @@ class NovaSonicBidirectionalStreamClient
     @session_cleanup_in_progress.include?(session_id)
   end
   
-  # Initiate a bidirectional stream session
+  # Initiate a bidirectional stream session - simplified to match example.rb exactly
   def initiate_session(session_id)
     session_data = @active_sessions[session_id]
     if !session_data
       raise "Stream session #{session_id} not found"
     end
     
+    # Skip if this session is already being initialized
+    if session_data[:initializing]
+      @logger.info "Session #{session_id} is already being initialized, skipping"
+      return
+    end
+    
+    # Mark session as being initialized
+    session_data[:initializing] = true
+    
     begin
-      # Create all events first exactly matching example.rb
-      @logger.info "Setting up events sequence for session #{session_id}..."
+      # Very simple approach - directly based on example.rb
+      input_stream = Aws::BedrockRuntime::EventStreams::InvokeModelWithBidirectionalStreamInput.new
+      output_stream = Aws::BedrockRuntime::EventStreams::InvokeModelWithBidirectionalStreamOutput.new
       
-      # Create an array of events to send in precise order
-      events = []
+      # Configure output stream handlers
+      output_stream.on_event do |event|
+        @logger.info "Got event from Bedrock: #{event['event_type']}"
+        
+        if event.is_a?(Hash) && event.key?(:event_type)
+          if event[:event_type] == :chunk && event[:bytes]
+            begin
+              json_response = JSON.parse(event[:bytes])
+              process_response(session_id, json_response)
+            rescue JSON::ParserError => e
+              @logger.error "Failed to parse JSON response: #{e.message}"
+            end
+          elsif event[:event_type] == :error
+            @logger.error "Stream error from Bedrock: #{event[:error]}"
+            dispatch_event_for_session(session_id, 'error', {
+              source: 'stream',
+              error: event[:error]
+            })
+          end
+        elsif event.is_a?(Struct) && event.respond_to?(:message)
+          @logger.error "Error from Bedrock: #{event.message}"
+          dispatch_event_for_session(session_id, 'error', {
+            source: 'bedrock',
+            error: event.message
+          })
+        end
+      end
       
-      # 1. Session start event
-      events << {
-        event: {
-          sessionStart: {
-            inferenceConfiguration: {
-              maxTokens: 10000,
-              topP: 0.95,
-              temperature: 0.9
-            }
-          }
-        }
-      }.to_json
-      
-      # 2. Prompt start event
-      events << {
-        event: {
-          promptStart: {
-            promptName: session_data[:prompt_name],
-            textOutputConfiguration: {
-              mediaType: "text/plain"
-            },
-            audioOutputConfiguration: {
-              mediaType: "audio/lpcm",
-              sampleRateHertz: 24000,
-              sampleSizeBits: 16,
-              channelCount: 1,
-              voiceId: "en_us_matthew",
-              encoding: "base64",
-              audioType: "SPEECH"
-            },
-            toolUseOutputConfiguration: {
-              mediaType: "application/json"
-            },
-            toolConfiguration: {
-              tools: []
-            }
-          }
-        }
-      }.to_json
-      
-      # 3. Content start for text (system prompt)
+      # Generate UUIDs for the session
+      prompt_id = SecureRandom.uuid
       text_content_id = SecureRandom.uuid
-      events << {
-        event: {
-          contentStart: {
-            promptName: session_data[:prompt_name],
-            contentName: text_content_id,
-            type: "TEXT",
-            interactive: true,
-            textInputConfiguration: {
-              mediaType: "text/plain"
+      audio_content_id = SecureRandom.uuid
+      
+      # Store the IDs in the session data
+      session_data[:prompt_name] = prompt_id
+      session_data[:audio_content_id] = audio_content_id
+      
+      # Start the request
+      async_resp = @bedrock_runtime_client.invoke_model_with_bidirectional_stream(
+        model_id: "amazon.nova-sonic-v1:0",
+        input_event_stream_handler: input_stream,
+        output_event_stream_handler: output_stream
+      )
+      
+      # Create all the events exactly as in example.rb
+      events = [
+        # Start session
+        {
+          "event": {
+            "sessionStart": {
+              "inferenceConfiguration": {
+                "maxTokens": 10000,
+                "topP": 0.95,
+                "temperature": 0.9
+              }
             }
           }
-        }
-      }.to_json
-      
-      # 4. Text input (system prompt)
-      events << {
-        event: {
-          textInput: {
-            promptName: session_data[:prompt_name],
-            contentName: text_content_id,
-            content: DEFAULT_SYSTEM_PROMPT,
-            role: "SYSTEM"
-          }
-        }
-      }.to_json
-      
-      # 5. Content end for text
-      events << {
-        event: {
-          contentEnd: {
-            promptName: session_data[:prompt_name],
-            contentName: text_content_id
-          }
-        }
-      }.to_json
-      
-      # 6. Content start for audio
-      events << {
-        event: {
-          contentStart: {
-            promptName: session_data[:prompt_name],
-            contentName: session_data[:audio_content_id],
-            type: "AUDIO",
-            interactive: true,
-            audioInputConfiguration: {
-              mediaType: "audio/lpcm",
-              sampleRateHertz: 16000,
-              sampleSizeBits: 16,
-              channelCount: 1,
-              audioType: "SPEECH",
-              encoding: "base64"
+        }.to_json,
+        
+        # Start prompt
+        {
+          "event": {
+            "promptStart": {
+              "promptName": prompt_id,
+              "textOutputConfiguration": {
+                "mediaType": "text/plain"
+              },
+              "audioOutputConfiguration": {
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": 24000,
+                "sampleSizeBits": 16,
+                "channelCount": 1,
+                "voiceId": "en_us_matthew",
+                "encoding": "base64",
+                "audioType": "SPEECH"
+              },
+              "toolUseOutputConfiguration": {
+                "mediaType": "application/json"
+              },
+              "toolConfiguration": {
+                "tools": []
+              }
             }
           }
-        }
-      }.to_json
+        }.to_json,
+        
+        # Start content
+        {
+          "event": {
+            "contentStart": {
+              "promptName": prompt_id,
+              "contentName": text_content_id,
+              "type": "TEXT",
+              "interactive": true,
+              "textInputConfiguration": {
+                "mediaType": "text/plain"
+              }
+            }
+          }
+        }.to_json,
+        
+        # System Setup
+        {
+          "event": {
+            "textInput": {
+              "promptName": prompt_id,
+              "contentName": text_content_id,
+              "content": "You are a friend. The user and you will engage in a spoken dialog exchanging the transcripts of a natural real-time conversation. Keep your responses short, generally two or three sentences for chatty scenarios.",
+              "role": "SYSTEM"
+            }
+          }
+        }.to_json,
+        
+        # End System Setup
+        {
+          "event": {
+            "contentEnd": {
+              "promptName": prompt_id,
+              "contentName": text_content_id
+            }
+          }
+        }.to_json,
+        
+        # Start Audio Stream
+        {
+          "event": {
+            "contentStart": {
+              "promptName": prompt_id,
+              "contentName": audio_content_id,
+              "type": "AUDIO",
+              "interactive": true,
+              "audioInputConfiguration": {
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": 16000,
+                "sampleSizeBits": 16,
+                "channelCount": 1,
+                "audioType": "SPEECH",
+                "encoding": "base64"
+              }
+            }
+          }
+        }.to_json
+      ]
       
-      # Start the bidirectional stream
-      start_bidirectional_stream(session_id, events)
+      # Save the input_stream and async_resp to the session data
+      session_data[:input_stream] = input_stream
+      session_data[:async_resp] = async_resp
       
+      # Send all initial events
+      events.each do |event|
+        input_stream.signal_chunk_event(bytes: event)
+      end
+      
+      # Mark as active
+      session_data[:is_active] = true
+      session_data[:is_prompt_start_sent] = true
+      session_data[:is_audio_content_start_sent] = true
+      
+      @logger.info "Session #{session_id} initialized successfully"
     rescue => e
-      @logger.error "Error in session #{session_id}: #{e.message}"
+      @logger.error "Error initializing session #{session_id}: #{e.message}"
       @logger.error e.backtrace.join("\n")
+      
       dispatch_event_for_session(session_id, 'error', {
-        source: 'bidirectional_stream',
+        source: 'initialization',
         error: e.message
       })
       
-      # Make sure to clean up if there's an error
       if session_data[:is_active]
-        close_session(session_id)
+        session_data[:is_active] = false
       end
+    ensure
+      session_data[:initializing] = false
     end
   end
   
@@ -981,11 +1008,20 @@ class NovaSonicBidirectionalStreamClient
     @logger.info "Initial events setup complete for session #{session_id}"
   end
   
-  # Stream audio chunk
+  # Stream audio chunk - simplified to match example.rb
   def stream_audio_chunk(session_id, audio_data)
     session_data = @active_sessions[session_id]
-    if !session_data || !session_data[:is_active] || !session_data[:audio_content_id]
-      raise "Invalid session #{session_id} for audio streaming"
+    
+    # Check if session exists and is active
+    if !session_data || !session_data[:is_active]
+      @logger.error "Session #{session_id} not found or inactive"
+      raise "Session not active or not found: #{session_id}"
+    end
+    
+    # Verify we have an input stream available
+    if !session_data[:input_stream]
+      @logger.error "No input stream available for session #{session_id}"
+      raise "No input stream available for session: #{session_id}"
     end
     
     # Validate audio data
@@ -994,50 +1030,30 @@ class NovaSonicBidirectionalStreamClient
       raise "Empty audio data received"
     end
     
-    # Check if audio data looks like valid PCM data
-    begin
-      # Try to read a sample of the audio data
-      sample_rate = 16000 # Expected from DEFAULT_AUDIO_INPUT_CONFIGURATION
-      sample_size = 2     # 16-bit audio = 2 bytes per sample
-      num_samples = [10, audio_data.size / sample_size].min
-      
-      if num_samples > 0
-        @logger.debug "Audio data sample (#{num_samples} samples): #{audio_data.byteslice(0, num_samples * sample_size).unpack('s*').inspect}"
-      end
-    rescue => e
-      @logger.warn "Could not analyze audio data: #{e.message}"
-    end
-    
     # Convert audio to base64
     base64_data = Base64.strict_encode64(audio_data)
     
     # Log audio data length for debugging
-    @logger.info "Adding audio chunk (#{audio_data.size} bytes raw, #{base64_data.length} bytes base64) to queue for session #{session_id}"
+    @logger.info "Sending audio chunk: #{audio_data.size} bytes raw, #{base64_data.length} bytes base64"
     
-    # Create the event payload - this matches the format in example.rb
+    # Create the audio event in the exact format used in example.rb
     audio_event = {
-      event: {
-        audioInput: {
-          promptName: session_data[:prompt_name],
-          contentName: session_data[:audio_content_id],
-          content: base64_data,
-          role: "USER"
+      "event": {
+        "audioInput": {
+          "promptName": session_data[:prompt_name],
+          "contentName": session_data[:audio_content_id],
+          "content": base64_data,
+          "role": "USER"
         }
       }
     }.to_json
     
     begin
-      # If we have an input stream, send the audio data directly
-      if session_data[:input_stream]
-        session_data[:input_stream].signal_chunk_event(bytes: audio_event)
-        @logger.debug "Audio chunk directly sent to AWS for session #{session_id}"
-      else
-        # Otherwise queue it for later
-        add_event_to_session_queue(session_id, audio_event)
-        @logger.debug "Audio chunk queued for session #{session_id}"
-      end
+      # Send directly to the input stream
+      session_data[:input_stream].signal_chunk_event(bytes: audio_event)
+      @logger.debug "Audio chunk sent to AWS"
     rescue => e
-      @logger.error "Failed to send audio chunk for session #{session_id}: #{e.message}"
+      @logger.error "Failed to send audio chunk: #{e.message}"
       @logger.error e.backtrace.join("\n")
       raise "Failed to send audio: #{e.message}"
     end
@@ -1099,84 +1115,79 @@ class NovaSonicBidirectionalStreamClient
   # Send content end
   def send_content_end(session_id)
     session_data = @active_sessions[session_id]
-    return unless session_data && session_data[:is_audio_content_start_sent]
+    return unless session_data && session_data[:is_active]
     
     puts "Sending contentEnd for session #{session_id}"
     
-    add_event_to_session_queue(session_id, {
-      event: {
-        contentEnd: {
-          promptName: session_data[:prompt_name],
-          contentName: session_data[:audio_content_id]
+    event = {
+      "event": {
+        "contentEnd": {
+          "promptName": session_data[:prompt_name],
+          "contentName": session_data[:audio_content_id]
         }
       }
-    })
+    }.to_json
     
-    # Give a small delay to ensure it's processed
-    puts "Waiting for contentEnd to be processed..."
-    sleep(0.5)
-    puts "ContentEnd wait completed"
+    begin
+      session_data[:input_stream].signal_chunk_event(bytes: event)
+      puts "Content end event sent"
+    rescue => e
+      puts "Error sending content end: #{e.message}"
+    end
   end
   
   # Send prompt end
   def send_prompt_end(session_id)
     session_data = @active_sessions[session_id]
-    return unless session_data && session_data[:is_prompt_start_sent]
+    return unless session_data && session_data[:is_active]
     
     puts "Sending promptEnd for session #{session_id}"
     
-    add_event_to_session_queue(session_id, {
-      event: {
-        promptEnd: {
-          promptName: session_data[:prompt_name]
+    event = {
+      "event": {
+        "promptEnd": {
+          "promptName": session_data[:prompt_name]
         }
       }
-    })
+    }.to_json
     
-    # Give a small delay to ensure it's processed
-    puts "Waiting for promptEnd to be processed..."
-    sleep(0.3)
-    puts "PromptEnd wait completed"
+    begin
+      session_data[:input_stream].signal_chunk_event(bytes: event)
+      puts "Prompt end event sent"
+    rescue => e
+      puts "Error sending prompt end: #{e.message}"
+    end
   end
   
   # Send session end
   def send_session_end(session_id)
     session_data = @active_sessions[session_id]
-    return unless session_data
+    return unless session_data && session_data[:is_active]
     
     puts "Sending sessionEnd for session #{session_id}"
     
-    add_event_to_session_queue(session_id, {
-      event: {
-        sessionEnd: {}
+    event = {
+      "event": {
+        "sessionEnd": {}
       }
-    })
+    }.to_json
     
-    # Give a small delay to ensure it's processed
-    puts "Waiting for sessionEnd to be processed..."
-    sleep(0.3)
-    puts "SessionEnd wait completed"
-    
-    # Explicitly tell the input stream to close
-    if session_data[:input_stream]
-      puts "Signaling end of input stream for session #{session_id}"
-      begin
-        session_data[:input_stream].signal_end_stream
-        puts "Successfully signaled end of input stream"
-      rescue => e
-        puts "Error signaling end of input stream: #{e.message}"
-      end
-    else
-      puts "No input stream available to signal end for session #{session_id}"
+    begin
+      session_data[:input_stream].signal_chunk_event(bytes: event)
+      puts "Session end event sent"
+      
+      # Close the input stream
+      session_data[:input_stream].signal_end_stream
+      
+      # Clean up
+      session_data[:is_active] = false
+      @active_sessions.delete(session_id)
+      @session_last_activity.delete(session_id)
+      
+      @logger.info "Session #{session_id} closed and removed from active sessions"
+    rescue => e
+      puts "Error sending session end: #{e.message}"
     end
-    
-    # Now it's safe to clean up
-    session_data[:is_active] = false
-    # Set the close signal to notify waiting threads
-    session_data[:close_signal].set
-    @active_sessions.delete(session_id)
-    @session_last_activity.delete(session_id)
-    @logger.info "Session #{session_id} closed and removed from active sessions"
   end
   
   # Dispatch events to handlers for a specific session

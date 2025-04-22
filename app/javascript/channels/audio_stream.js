@@ -92,26 +92,69 @@ function startRecording() {
     session_id: window.sessionId
   });
 
-  navigator.mediaDevices.getUserMedia({ audio: true })
+  navigator.mediaDevices.getUserMedia({ 
+    audio: {
+      sampleRate: 16000,
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    }
+  })
     .then(stream => {
       audioStream = stream;
-      recorder = new MediaRecorder(stream);
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && subscription) {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            subscription.send({
-              type: 'audio_input',
-              audio_data: reader.result,
-              session_id: window.sessionId
-            });
-          };
-          reader.readAsDataURL(event.data);
+      
+      // Create AudioContext for processing audio
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 16000
+      });
+      
+      // Create audio source from stream
+      const source = audioContext.createMediaStreamSource(stream);
+      
+      // Create processor to handle audio
+      const processor = audioContext.createScriptProcessor(512, 1, 1);
+      
+      processor.onaudioprocess = (e) => {
+        // Get raw audio data
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Convert to 16-bit PCM
+        const pcmData = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+        }
+        
+        // Convert to base64 (browser-safe way)
+        const base64Data = arrayBufferToBase64(pcmData.buffer);
+        
+        // Send to server
+        if (subscription) {
+          subscription.send({
+            type: 'audio_input',
+            audio_data: base64Data,
+            session_id: window.sessionId
+          });
         }
       };
-
-      recorder.start(1000);
+      
+      // Connect nodes
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      // Store references
+      recorder = {
+        audioContext: audioContext,
+        source: source,
+        processor: processor,
+        state: 'recording',
+        stop: function() {
+          this.state = 'inactive';
+          source.disconnect();
+          processor.disconnect();
+        }
+      };
+      
       document.getElementById('startButton').disabled = true;
       document.getElementById('stopButton').disabled = false;
     })
@@ -121,10 +164,22 @@ function startRecording() {
     });
 }
 
+function arrayBufferToBase64(buffer) {
+  const binary = [];
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary.push(String.fromCharCode(bytes[i]));
+  }
+  return btoa(binary.join(''));
+}
+
 function stopRecording() {
   if (recorder && recorder.state === 'recording') {
     recorder.stop();
-    audioStream.getTracks().forEach(track => track.stop());
+    
+    if (audioStream) {
+      audioStream.getTracks().forEach(track => track.stop());
+    }
     
     if (subscription) {
       subscription.send({
