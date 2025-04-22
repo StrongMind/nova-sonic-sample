@@ -6,6 +6,110 @@ let subscription = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+// ---------------- Audio Player Implementation ----------------
+// Implementation based on the approach in node-example/public/src/main.js
+let audioContext = null;
+let audioWorkletNode = null;
+let audioInitialized = false;
+
+// Base64 to Float32Array conversion (same as in main.js)
+function base64ToFloat32Array(base64String) {
+  try {
+    const binaryString = window.atob(base64String);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    const int16Array = new Int16Array(bytes.buffer);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768.0;
+    }
+
+    return float32Array;
+  } catch (error) {
+    console.error('Error in base64ToFloat32Array:', error);
+    throw error;
+  }
+}
+
+// Initialize audio context for playback
+async function initAudioPlayer() {
+  if (audioInitialized) return;
+  
+  try {
+    // Check default system sample rate first
+    const tempContext = new (window.AudioContext || window.webkitAudioContext)();
+    const systemSampleRate = tempContext.sampleRate;
+    tempContext.close();
+    
+    console.log(`System audio sample rate: ${systemSampleRate}Hz, Bedrock audio sample rate: 16000Hz`);
+    
+    // Always try to use 16000Hz to match Bedrock's output
+    // On some browsers this may be overridden to the system rate
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 16000 // Match Bedrock's output sample rate
+    });
+    
+    console.log(`Actual audio context sample rate: ${audioContext.sampleRate}Hz`);
+    
+    // Create a simple gain node for volume control
+    const gainNode = audioContext.createGain();
+    gainNode.gain.value = 1.0; // Set volume to 100%
+    gainNode.connect(audioContext.destination);
+    
+    audioInitialized = true;
+    console.log("Audio player initialized successfully");
+    return gainNode;
+  } catch (error) {
+    console.error("Failed to initialize audio player:", error);
+    return null;
+  }
+}
+
+// Play audio using the simple player
+async function playAudio(float32AudioData) {
+  if (!audioInitialized) {
+    await initAudioPlayer();
+  }
+  
+  if (!audioContext) {
+    console.error("Audio context not available");
+    return;
+  }
+  
+  try {
+    const bedrockSampleRate = 16000;
+    const outputSampleRate = audioContext.sampleRate;
+    
+    // If the sample rates don't match, we need to resample
+    if (bedrockSampleRate !== outputSampleRate) {
+      console.warn(`Audio sample rate mismatch: Bedrock sample rate is ${bedrockSampleRate}Hz, but audio context sample rate is ${outputSampleRate}Hz`);
+    }
+    
+    // Create an audio buffer with the audio data
+    const audioBuffer = audioContext.createBuffer(1, float32AudioData.length, outputSampleRate);
+    const channelData = audioBuffer.getChannelData(0);
+    
+    // Copy the float32 audio data to the buffer
+    channelData.set(float32AudioData);
+    
+    // Create a buffer source
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    
+    // Connect to the audio context destination
+    source.connect(audioContext.destination);
+    
+    // Start playing
+    source.start();
+    console.log("Audio playback started with sample rate:", outputSampleRate);
+  } catch (error) {
+    console.error("Error playing audio:", error);
+  }
+}
+
 function connect() {
   if (subscription) {
     console.log("Cleaning up existing subscription");
@@ -114,7 +218,12 @@ function connect() {
           // Get audio content, handling different possible structures
           let audioContent = '';
           if (data.data && data.data.event && data.data.event.audioOutput) {
-            audioContent = data.data.event.audioOutput.content;
+            const audioOutput = data.data.event.audioOutput;
+            audioContent = audioOutput.content;
+            console.log("Audio configuration:", audioOutput.mediaType, 
+                      audioOutput.sampleRateHertz, 
+                      audioOutput.sampleSizeBits, 
+                      audioOutput.channelCount);
           } else if (data.data && data.data.content) {
             audioContent = data.data.content;
           } else if (data.data) {
@@ -127,26 +236,13 @@ function connect() {
             return;
           }
           
-          // Convert base64 string to audio and play it
           try {
-            const audioData = atob(audioContent);
-            const audioArray = new Uint8Array(audioData.length);
-            for (let i = 0; i < audioData.length; i++) {
-              audioArray[i] = audioData.charCodeAt(i);
-            }
-            
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            audioContext.decodeAudioData(audioArray.buffer, function(buffer) {
-              const source = audioContext.createBufferSource();
-              source.buffer = buffer;
-              source.connect(audioContext.destination);
-              source.start(0);
-            })
-            .catch(error => {
-              console.error("Error decoding audio data:", error);
-            });
+            // Using the same approach as in main.js
+            const audioData = base64ToFloat32Array(audioContent);
+            playAudio(audioData);
+            console.log("Audio playback started with sample count:", audioData.length);
           } catch (error) {
-            console.error("Error processing audio:", error);
+            console.error("Error processing audio:", error, error.stack);
           }
         }
         
@@ -306,6 +402,88 @@ function stopRecording() {
     document.getElementById('startButton').disabled = false;
     document.getElementById('stopButton').disabled = true;
   }
+}
+
+// Function to create a WAV file from LPCM data
+function createWavFromLPCM(lpcmData, sampleRate, bitsPerSample, numChannels) {
+  // WAV header size
+  const headerSize = 44;
+  
+  // Create a new ArrayBuffer for the WAV file (header + data)
+  const wavBuffer = new ArrayBuffer(headerSize + lpcmData.length);
+  const view = new DataView(wavBuffer);
+  
+  // Write WAV header
+  // "RIFF" chunk descriptor
+  view.setUint8(0, 0x52); // 'R'
+  view.setUint8(1, 0x49); // 'I'
+  view.setUint8(2, 0x46); // 'F' 
+  view.setUint8(3, 0x46); // 'F'
+  
+  // Chunk size: 4 (WAVE) + 24 (fmt ) + 8 (data header) + data length
+  view.setUint32(4, 36 + lpcmData.length, true);
+  
+  // "WAVE" format
+  view.setUint8(8, 0x57);  // 'W'
+  view.setUint8(9, 0x41);  // 'A'
+  view.setUint8(10, 0x56); // 'V'
+  view.setUint8(11, 0x45); // 'E'
+  
+  // "fmt " sub-chunk
+  view.setUint8(12, 0x66); // 'f'
+  view.setUint8(13, 0x6D); // 'm'
+  view.setUint8(14, 0x74); // 't'
+  view.setUint8(15, 0x20); // ' '
+  
+  // Sub-chunk size (16 for PCM)
+  view.setUint32(16, 16, true);
+  
+  // Audio format (1 = PCM)
+  view.setUint16(20, 1, true);
+  
+  // Number of channels
+  view.setUint16(22, numChannels, true);
+  
+  // Sample rate
+  view.setUint32(24, sampleRate, true);
+  
+  // Byte rate: SampleRate * NumChannels * BitsPerSample/8
+  view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
+  
+  // Block align: NumChannels * BitsPerSample/8
+  view.setUint16(32, numChannels * (bitsPerSample / 8), true);
+  
+  // Bits per sample
+  view.setUint16(34, bitsPerSample, true);
+  
+  // "data" sub-chunk
+  view.setUint8(36, 0x64); // 'd'
+  view.setUint8(37, 0x61); // 'a'
+  view.setUint8(38, 0x74); // 't'
+  view.setUint8(39, 0x61); // 'a'
+  
+  // Data size (raw audio data size)
+  view.setUint32(40, lpcmData.length, true);
+  
+  // Copy audio data
+  const wavBytes = new Uint8Array(wavBuffer);
+  wavBytes.set(lpcmData, headerSize);
+  
+  // Additional check for 16-bit PCM
+  if (bitsPerSample === 16) {
+    // We may need to swap bytes for endianness if the audio is garbled
+    // If your audio sounds garbled, try uncommenting this code
+    
+    const dataView = new DataView(wavBuffer);
+    for (let i = 0; i < lpcmData.length / 2; i++) {
+      const offset = headerSize + i * 2;
+      const value = dataView.getInt16(offset, true); // Read as little endian
+      dataView.setInt16(offset, value, false); // Write as big endian
+    }
+    
+  }
+  
+  return wavBytes;
 }
 
 // Set up event listeners when the DOM is loaded

@@ -24,10 +24,10 @@ class NovaSonicBidirectionalStreamClient
   
   DEFAULT_AUDIO_OUTPUT_CONFIGURATION = {
     mediaType: 'audio/lpcm',
-    sampleRateHertz: 24000,
+    sampleRateHertz: 16000,
     sampleSizeBits: 16,
     channelCount: 1,
-    voiceId: 'en_us_matthew',
+    voiceId: 'en_us_tiffany',
     encoding: 'base64',
     audioType: 'SPEECH'
   }
@@ -442,10 +442,10 @@ class NovaSonicBidirectionalStreamClient
               },
               "audioOutputConfiguration": {
                 "mediaType": "audio/lpcm",
-                "sampleRateHertz": 24000,
+                "sampleRateHertz": 16000,
                 "sampleSizeBits": 16,
                 "channelCount": 1,
-                "voiceId": "en_us_matthew",
+                "voiceId": "en_us_tiffany",
                 "encoding": "base64",
                 "audioType": "SPEECH"
               },

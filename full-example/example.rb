@@ -56,10 +56,10 @@ PREAMBLE = [
         },
         "audioOutputConfiguration": {
           "mediaType": "audio/lpcm",
-          "sampleRateHertz": 24000,
+          "sampleRateHertz": 16000,
           "sampleSizeBits": 16,
           "channelCount": 1,
-          "voiceId": "en_us_matthew",
+          "voiceId": "en_us_tiffany",
           "encoding": "base64",
           "audioType": "SPEECH"
         },
