@@ -79,7 +79,7 @@ class AudioStreamChannel < ApplicationCable::Channel
       transmit({ type: 'audio_started', message: 'Audio streaming initialized' })
     when 'audio_input'
       if message_data['audio_data'].present?
-        logger.info "Processing audio_input for session #{@session_id}"
+        #logger.info "Processing audio_input for session #{@session_id}"
         if @session.nil?
           logger.info "No active session for audio_input, attempting to recreate session"
           begin
@@ -250,27 +250,164 @@ class AudioStreamChannel < ApplicationCable::Channel
 
   def setup_event_handlers
     @session.on_event('textOutput') do |data|
-      transmit({ type: 'textOutput', data: data })
+      # Handle both direct and nested event formats
+      processed_data = if data.is_a?(Hash) && data['event'] && data['event']['textOutput']
+        # Extract the nested event data
+        { type: 'textOutput', data: { event: { textOutput: data['event']['textOutput'] } } }
+      else
+        # Already in the expected format
+        { type: 'textOutput', data: data }
+      end
+      transmit(processed_data)
     end
 
     @session.on_event('audioOutput') do |data|
-      transmit({ type: 'audioOutput', data: data })
+      # Handle both direct and nested event formats
+      processed_data = if data.is_a?(Hash) && data['event'] && data['event']['audioOutput']
+        # Extract the nested event data
+        { type: 'audioOutput', data: { event: { audioOutput: data['event']['audioOutput'] } } }
+      else
+        # Already in the expected format
+        { type: 'audioOutput', data: data }
+      end
+      transmit(processed_data)
     end
 
     @session.on_event('error') do |data|
-      transmit({ type: 'error', data: data })
+      # Extract error message from various possible formats
+      error_message = nil
+      error_details = nil
+
+      if data.is_a?(Hash)
+        if data['event'] && data['event']['error']
+          # Nested event error format
+          error_message = data['event']['error']['message'] rescue "Unknown error"
+          error_details = data['event']['error']['details'] rescue nil
+        elsif data['message']
+          # Direct error message
+          error_message = data['message']
+          error_details = data['details']
+        elsif data['error']
+          # Error field
+          error_message = data['error']
+          error_details = data['source']
+        else
+          # Fallback
+          error_message = "Unknown error from Bedrock"
+          error_details = data.to_s
+        end
+      else
+        # Non-hash format
+        error_message = "Error occurred: #{data}"
+      end
+
+      transmit({ 
+        type: 'error', 
+        message: error_message,
+        details: error_details
+      })
     end
 
     @session.on_event('toolUse') do |data|
-      transmit({ type: 'toolUse', data: data })
+      # Handle both direct and nested event formats
+      processed_data = if data.is_a?(Hash) && data['event'] && data['event']['toolUse']
+        # Extract the nested event data
+        { type: 'toolUse', data: { event: { toolUse: data['event']['toolUse'] } } }
+      else
+        # Already in the expected format
+        { type: 'toolUse', data: data }
+      end
+      transmit(processed_data)
     end
 
     @session.on_event('toolResult') do |data|
-      transmit({ type: 'toolResult', data: data })
+      # Handle both direct and nested event formats
+      processed_data = if data.is_a?(Hash) && data['event'] && data['event']['toolResult']
+        # Extract the nested event data
+        { type: 'toolResult', data: { event: { toolResult: data['event']['toolResult'] } } }
+      else
+        # Already in the expected format
+        { type: 'toolResult', data: data }
+      end
+      transmit(processed_data)
     end
 
     @session.on_event('contentEnd') do |data|
-      transmit({ type: 'contentEnd', data: data })
+      # Handle both direct and nested event formats
+      processed_data = if data.is_a?(Hash) && data['event'] && data['event']['contentEnd']
+        # Extract the nested event data
+        { type: 'contentEnd', data: { event: { contentEnd: data['event']['contentEnd'] } } }
+      else
+        # Already in the expected format
+        { type: 'contentEnd', data: data }
+      end
+      transmit(processed_data)
+    end
+    
+    @session.on_event('contentStart') do |data|
+      # Handle both direct and nested event formats
+      processed_data = if data.is_a?(Hash) && data['event'] && data['event']['contentStart']
+        # Extract the nested event data
+        { type: 'contentStart', data: { event: { contentStart: data['event']['contentStart'] } } }
+      else
+        # Already in the expected format
+        { type: 'contentStart', data: data }
+      end
+      transmit(processed_data)
+    end
+    
+    @session.on_event('chunk') do |data|
+      # Process chunk data which may contain various event types
+      # This handles raw chunk events from Bedrock
+      logger.debug "Received chunk event: #{data.inspect}"
+      
+      # Extract and decode the bytes if present
+      if data.is_a?(Hash) && data['bytes']
+        begin
+          decoded_bytes = Base64.decode64(data['bytes'])
+          parsed_data = JSON.parse(decoded_bytes)
+          logger.debug "Decoded chunk data: #{parsed_data.inspect}"
+          
+          # Forward the decoded data to frontend
+          transmit({ 
+            type: 'chunk', 
+            data: parsed_data 
+          })
+          
+          # If this chunk contains specific events we already handle, process them directly
+          if parsed_data['event']
+            event_type = parsed_data['event'].keys.first
+            logger.debug "Chunk contains event type: #{event_type}"
+            
+            # Extract the specific event data
+            event_data = { 'event' => parsed_data['event'] }
+            
+            # Process specific event types if needed
+            case event_type
+            when 'textOutput'
+              # For text outputs inside chunks, we might want to forward directly
+              transmit({ type: 'textOutput', data: event_data })
+            when 'contentEnd'
+              # Special handling for contentEnd events
+              transmit({ type: 'contentEnd', data: event_data })
+            end
+          end
+        rescue => e
+          logger.error "Error processing chunk data: #{e.message}"
+          logger.error "Original chunk data: #{data.inspect}"
+        end
+      else
+        # Forward the raw chunk
+        transmit({ type: 'chunk', data: data })
+      end
+    end
+
+    # Catch-all for any unhandled event types
+    @session.on_event('any') do |data|
+      if data.is_a?(Hash) && data[:type] && !['textOutput', 'audioOutput', 'error', 'toolUse', 'toolResult', 'contentEnd', 'contentStart', 'chunk'].include?(data[:type])
+        logger.info "Received unhandled event type: #{data[:type]}"
+        transmit({ type: data[:type], data: data[:data] })
+      end
     end
   end
 
@@ -278,16 +415,16 @@ class AudioStreamChannel < ApplicationCable::Channel
     return unless @session
     
     begin
-      logger.info "Processing audio data for session #{@session_id}"
+      #logger.info "Processing audio data for session #{@session_id}"
       
       # Log incoming data format/size
-      logger.debug "Raw audio data length: #{audio_data.length} characters"
-      logger.debug "Audio data format check: starts with data:audio prefix? #{audio_data.start_with?('data:audio') ? 'yes' : 'no'}"
+      #logger.debug "Raw audio data length: #{audio_data.length} characters"
+      #logger.debug "Audio data format check: starts with data:audio prefix? #{audio_data.start_with?('data:audio') ? 'yes' : 'no'}"
       
       # Convert base64 string to binary data
       begin
         audio_buffer = Base64.decode64(audio_data)
-        logger.debug "Base64 decode successful, got #{audio_buffer.bytesize} bytes"
+        #logger.debug "Base64 decode successful, got #{audio_buffer.bytesize} bytes"
       rescue => e
         logger.error "Base64 decode failed: #{e.message}"
         transmit({ type: 'error', message: 'Failed to decode audio data', details: e.message })
@@ -309,9 +446,9 @@ class AudioStreamChannel < ApplicationCable::Channel
       end
       
       # Further analysis of the decoded buffer
-      logger.debug "Streaming #{audio_buffer.size} bytes of audio data"
+      #logger.debug "Streaming #{audio_buffer.size} bytes of audio data"
       sample_bytes = [audio_buffer[0..15].unpack('C*')].flatten.map{|b| b.to_s(16).rjust(2, '0')}.join(' ')
-      logger.debug "Audio buffer first 16 bytes (hex): #{sample_bytes}"
+      #logger.debug "Audio buffer first 16 bytes (hex): #{sample_bytes}"
       
       # Check if the data looks like expected 16kHz, 16-bit PCM (very rough check)
       if audio_buffer.bytesize % 2 != 0
@@ -329,21 +466,21 @@ class AudioStreamChannel < ApplicationCable::Channel
       end
       
       # We'll transmit a processing notification to let the client know we're handling the audio
-      transmit({
-        type: 'audio_processing',
-        message: 'Processing audio data',
-        size: audio_buffer.size,
-        format: 'audio/lpcm'
-      })
+      # transmit({
+      #   type: 'audio_processing',
+      #   message: 'Processing audio data',
+      #   size: audio_buffer.size,
+      #   format: 'audio/lpcm'
+      # })
       
       # Stream the audio data to AWS
       begin
         # For this debugging session, let's log the format used in the example
-        logger.debug "Using audio format: audio/lpcm, 16kHz, 16-bit, mono"
+        #logger.debug "Using audio format: audio/lpcm, 16kHz, 16-bit, mono"
         
         # Stream the audio data
         @session.stream_audio(audio_buffer)
-        logger.debug "Audio data successfully sent to streaming session"
+        #logger.debug "Audio data successfully sent to streaming session"
       rescue => stream_error
         logger.error "Error streaming audio to session: #{stream_error.message}"
         logger.error stream_error.backtrace.join("\n")

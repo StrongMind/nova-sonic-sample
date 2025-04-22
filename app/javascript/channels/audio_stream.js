@@ -51,11 +51,126 @@ function connect() {
 
       received(data) {
         console.log("Received data:", data);
+        
+        // Handle subscription confirmation
         if (data.type === 'confirm_subscription') {
-          console.log("Subscription confirmed");
+          console.log("Subscription confirmed with session ID:", data.sessionId);
           document.getElementById('startButton').disabled = false;
         }
-        if (data.message) {
+        
+        // Handle audio processing status
+        else if (data.type === 'audio_processing') {
+          console.log(`Processing ${data.size} bytes of audio data in ${data.format} format`);
+        }
+        
+        // Handle chunk events from Bedrock
+        else if (data.type === 'chunk') {
+          console.log("Received chunk data:", data);
+          
+          // Extract text content from chunk if available
+          if (data.data && data.data.event && data.data.event.textOutput) {
+            const textContent = data.data.event.textOutput.content;
+            if (textContent) {
+              const chatHistory = document.getElementById('chatHistory');
+              const messageDiv = document.createElement('div');
+              messageDiv.className = 'message assistant';
+              messageDiv.textContent = textContent;
+              chatHistory.appendChild(messageDiv);
+              chatHistory.scrollTop = chatHistory.scrollHeight;
+            }
+          }
+        }
+        
+        // Handle text output from Bedrock model
+        else if (data.type === 'textOutput') {
+          console.log("Received text output:", data);
+          
+          // Handle both formats: direct content or nested event structure
+          let content = '';
+          if (data.data && data.data.event && data.data.event.textOutput) {
+            content = data.data.event.textOutput.content;
+          } else if (data.data && data.data.content) {
+            content = data.data.content;
+          } else if (data.data) {
+            // If we can't find content in expected places, log the data and use stringified version
+            console.warn("Unexpected textOutput structure:", data.data);
+            content = JSON.stringify(data.data);
+          }
+          
+          if (content) {
+            const chatHistory = document.getElementById('chatHistory');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.textContent = content;
+            chatHistory.appendChild(messageDiv);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+          }
+        }
+        
+        // Handle audio output from Bedrock model
+        else if (data.type === 'audioOutput') {
+          console.log("Received audio output");
+          
+          // Get audio content, handling different possible structures
+          let audioContent = '';
+          if (data.data && data.data.event && data.data.event.audioOutput) {
+            audioContent = data.data.event.audioOutput.content;
+          } else if (data.data && data.data.content) {
+            audioContent = data.data.content;
+          } else if (data.data) {
+            console.warn("Unexpected audioOutput structure:", data.data);
+            return; // Can't process audio without proper content
+          }
+          
+          if (!audioContent) {
+            console.error("No audio content found in output");
+            return;
+          }
+          
+          // Convert base64 string to audio and play it
+          try {
+            const audioData = atob(audioContent);
+            const audioArray = new Uint8Array(audioData.length);
+            for (let i = 0; i < audioData.length; i++) {
+              audioArray[i] = audioData.charCodeAt(i);
+            }
+            
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            audioContext.decodeAudioData(audioArray.buffer, function(buffer) {
+              const source = audioContext.createBufferSource();
+              source.buffer = buffer;
+              source.connect(audioContext.destination);
+              source.start(0);
+            })
+            .catch(error => {
+              console.error("Error decoding audio data:", error);
+            });
+          } catch (error) {
+            console.error("Error processing audio:", error);
+          }
+        }
+        
+        // Handle errors
+        else if (data.type === 'error') {
+          console.error("Received error:", data.message, data.details);
+          
+          const chatHistory = document.getElementById('chatHistory');
+          const errorDiv = document.createElement('div');
+          errorDiv.className = 'message error';
+          errorDiv.textContent = `Error: ${data.message}`;
+          if (data.details) {
+            const detailsDiv = document.createElement('div');
+            detailsDiv.className = 'error-details';
+            detailsDiv.textContent = data.details;
+            errorDiv.appendChild(detailsDiv);
+          }
+          chatHistory.appendChild(errorDiv);
+          chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+        
+        // Handle any other messages for display
+        else if (data.message) {
+          console.log("Received message:", data.message);
           appendMessage(data.message);
         }
       }

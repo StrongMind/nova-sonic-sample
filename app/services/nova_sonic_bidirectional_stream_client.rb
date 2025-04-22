@@ -152,7 +152,7 @@ class NovaSonicBidirectionalStreamClient
     # Only use supported parameters
     client_options = {
       region: region,
-      http_wire_trace: true, # Enable HTTP tracing for debugging
+      http_wire_trace: false, # Enable HTTP tracing for debugging
       enable_alpn: true     # Enable ALPN for HTTP/2
     }
     
@@ -235,7 +235,7 @@ class NovaSonicBidirectionalStreamClient
     @session_cleanup_in_progress.include?(session_id)
   end
   
-  # Initiate a bidirectional stream session - simplified to match example.rb exactly
+  # Initiate a bidirectional stream session - simplified to match example.rb
   def initiate_session(session_id)
     session_data = @active_sessions[session_id]
     if !session_data
@@ -244,7 +244,6 @@ class NovaSonicBidirectionalStreamClient
     
     # Skip if this session is already being initialized
     if session_data[:initializing]
-      @logger.info "Session #{session_id} is already being initialized, skipping"
       return
     end
     
@@ -258,29 +257,147 @@ class NovaSonicBidirectionalStreamClient
       
       # Configure output stream handlers
       output_stream.on_event do |event|
-        @logger.info "Got event from Bedrock: #{event['event_type']}"
+        puts "Received event: #{event.class} - #{event.inspect}"
         
-        if event.is_a?(Hash) && event.key?(:event_type)
-          if event[:event_type] == :chunk && event[:bytes]
+        # If it's a Hash, handle as before
+        if event.is_a?(Hash)
+          puts "Event is a Hash"
+          
+          if event.key?(:event_type)
+            puts "Event has :event_type key: #{event[:event_type]}"
+            
+            if event[:event_type] == :chunk && event[:bytes]
+              begin
+                response_data = JSON.parse(event[:bytes])
+                
+                if response_data['event']
+                  event_type = response_data['event'].keys.first
+                  event_data = response_data['event'][event_type]
+                  
+                  # Dispatch based on event type
+                  dispatch_event_for_session(session_id, event_type, event_data)
+                end
+              rescue JSON::ParserError => e
+                @logger.error "Failed to parse JSON response: #{e.message}"
+              end
+            elsif event[:event_type] == :error
+              @logger.error "Stream error for session #{session_id}: #{event[:error]}"
+              dispatch_event_for_session(session_id, 'error', {
+                source: 'stream',
+                error: event[:error]
+              })
+            end
+          else
+            puts "Event is a Hash but doesn't have :event_type key. Keys: #{event.keys.inspect}"
+          end
+        # If it's a BidirectionalOutputPayloadPart type, handle it
+        elsif defined?(Aws::BedrockRuntime::Types::BidirectionalOutputPayloadPart) && 
+              event.is_a?(Aws::BedrockRuntime::Types::BidirectionalOutputPayloadPart)
+          puts "Event is a BidirectionalOutputPayloadPart"
+          if event.event_type == :chunk && event.bytes
             begin
-              json_response = JSON.parse(event[:bytes])
-              process_response(session_id, json_response)
+              response_data = JSON.parse(event.bytes)
+              
+              if response_data['event']
+                event_type = response_data['event'].keys.first
+                event_data = response_data['event'][event_type]
+                
+                # Dispatch based on event type
+                dispatch_event_for_session(session_id, event_type, event_data)
+              end
             rescue JSON::ParserError => e
               @logger.error "Failed to parse JSON response: #{e.message}"
             end
-          elsif event[:event_type] == :error
-            @logger.error "Stream error from Bedrock: #{event[:error]}"
+          elsif event.event_type == :error
+            @logger.error "Stream error for session #{session_id}: #{event.error}"
             dispatch_event_for_session(session_id, 'error', {
               source: 'stream',
-              error: event[:error]
+              error: event.error
             })
           end
+        # If it's an AWS SDK event class, handle appropriately
+        elsif defined?(Aws::BedrockRuntime::Types) && event.is_a?(Aws::BedrockRuntime::Types.const_get("ChunkEvent"))
+          puts "Event is a ChunkEvent"
+          if event.bytes
+            begin
+              response_data = JSON.parse(event.bytes)
+              
+              if response_data['event']
+                event_type = response_data['event'].keys.first
+                event_data = response_data['event'][event_type]
+                
+                # Dispatch based on event type
+                dispatch_event_for_session(session_id, event_type, event_data)
+              end
+            rescue JSON::ParserError => e
+              @logger.error "Failed to parse JSON response: #{e.message}"
+            end
+          end
+        # If it's a struct with a message property (likely an error)
         elsif event.is_a?(Struct) && event.respond_to?(:message)
-          @logger.error "Error from Bedrock: #{event.message}"
+          error_message = event.message
+          @logger.error "Error in stream for session #{session_id}: #{error_message}"
+          
+          # Mark session for cleanup
+          session_data[:is_active] = false
+          
+          # Dispatch detailed error event
           dispatch_event_for_session(session_id, 'error', {
-            source: 'bedrock',
-            error: event.message
+            source: 'aws_bedrock',
+            error: error_message,
+            details: "AWS Bedrock returned an error. This could be due to expired credentials, invalid audio format, or service issues."
           })
+        # Handle all other cases
+        else
+          puts "Unknown event type: #{event.class}"
+          
+          # Try to infer event type if it responds to event_type
+          if event.respond_to?(:event_type)
+            puts "Event responds to event_type: #{event.event_type}"
+            event_type = event.event_type
+            
+            # Handle chunk events
+            if event_type == :chunk && event.respond_to?(:bytes)
+              begin
+                response_data = JSON.parse(event.bytes)
+                
+                if response_data['event']
+                  event_type = response_data['event'].keys.first
+                  event_data = response_data['event'][event_type]
+                  
+                  # Dispatch based on event type
+                  dispatch_event_for_session(session_id, event_type, event_data)
+                end
+              rescue JSON::ParserError => e
+                @logger.error "Failed to parse JSON response: #{e.message}"
+              end
+            # Handle error events
+            elsif event_type == :error && event.respond_to?(:error)
+              @logger.error "Stream error for session #{session_id}: #{event.error}"
+              dispatch_event_for_session(session_id, 'error', {
+                source: 'stream',
+                error: event.error
+              })
+            elsif event_type == :model_stream_error_exception
+              message = event.respond_to?(:message) ? event.message : "Unknown model stream error"
+              @logger.error "Model stream error for session #{session_id}: #{message}"
+              
+              # Mark session for cleanup
+              session_data[:is_active] = false
+              
+              # Dispatch detailed error event
+              dispatch_event_for_session(session_id, 'error', {
+                source: 'model_stream',
+                error: message,
+                details: "AWS Bedrock returned a model stream error."
+              })
+            end
+          else
+            puts "Event doesn't respond to event_type. Attempting to introspect..."
+            if event.respond_to?(:methods)
+              puts "Available methods: #{event.methods - Object.methods}"
+            end
+          end
         end
       end
       
@@ -406,18 +523,20 @@ class NovaSonicBidirectionalStreamClient
       
       # Send all initial events
       events.each do |event|
-        input_stream.signal_chunk_event(bytes: event)
+        begin
+          input_stream.signal_chunk_event(bytes: event)
+        rescue => e
+          @logger.error "Error sending initial event: #{e.message}"
+          raise "Failed to send initial event: #{e.message}"
+        end
       end
       
       # Mark as active
       session_data[:is_active] = true
       session_data[:is_prompt_start_sent] = true
       session_data[:is_audio_content_start_sent] = true
-      
-      @logger.info "Session #{session_id} initialized successfully"
     rescue => e
       @logger.error "Error initializing session #{session_id}: #{e.message}"
-      @logger.error e.backtrace.join("\n")
       
       dispatch_event_for_session(session_id, 'error', {
         source: 'initialization',
@@ -448,71 +567,152 @@ class NovaSonicBidirectionalStreamClient
       
       # Configure output stream handlers
       output_stream.on_event do |event|
-        puts "GOT OUTPUT EVENT FROM BEDROCK: #{event.inspect}"
+        puts "Received event: #{event.class} - #{event.inspect}"
         
-        if event.is_a?(Hash) && event.key?(:event_type)
-          event_type = event[:event_type]
+        # If it's a Hash, handle as before
+        if event.is_a?(Hash)
+          puts "Event is a Hash"
           
-          if event_type == :chunk
+          if event.key?(:event_type)
+            puts "Event has :event_type key: #{event[:event_type]}"
+            
+            if event[:event_type] == :chunk && event[:bytes]
+              begin
+                response_data = JSON.parse(event[:bytes])
+                
+                if response_data['event']
+                  event_type = response_data['event'].keys.first
+                  event_data = response_data['event'][event_type]
+                  
+                  # Dispatch based on event type
+                  dispatch_event_for_session(session_id, event_type, event_data)
+                end
+              rescue JSON::ParserError => e
+                @logger.error "Failed to parse JSON response: #{e.message}"
+              end
+            elsif event[:event_type] == :error
+              @logger.error "Stream error for session #{session_id}: #{event[:error]}"
+              dispatch_event_for_session(session_id, 'error', {
+                source: 'stream',
+                error: event[:error]
+              })
+            end
+          else
+            puts "Event is a Hash but doesn't have :event_type key. Keys: #{event.keys.inspect}"
+          end
+        # If it's a BidirectionalOutputPayloadPart type, handle it
+        elsif defined?(Aws::BedrockRuntime::Types::BidirectionalOutputPayloadPart) && 
+              event.is_a?(Aws::BedrockRuntime::Types::BidirectionalOutputPayloadPart)
+          puts "Event is a BidirectionalOutputPayloadPart"
+          if event.event_type == :chunk && event.bytes
             begin
-              if event[:bytes]
-                puts "Processing chunk event with bytes: #{event[:bytes][0..100]}..." 
-                json_response = JSON.parse(event[:bytes])
-                puts "Parsed JSON: #{json_response.inspect[0..200]}..."
-                process_response(session_id, json_response)
-              else
-                puts "Received chunk event without bytes!"
+              response_data = JSON.parse(event.bytes)
+              
+              if response_data['event']
+                event_type = response_data['event'].keys.first
+                event_data = response_data['event'][event_type]
+                
+                # Dispatch based on event type
+                dispatch_event_for_session(session_id, event_type, event_data)
               end
             rescue JSON::ParserError => e
               @logger.error "Failed to parse JSON response: #{e.message}"
-              puts "Failed to parse JSON response: #{e.message}"
-              puts "Raw bytes: #{event[:bytes]}" if event[:bytes]
             end
-          elsif event_type == :error
-            @logger.error "Stream error for session #{session_id}: #{event[:error]}"
-            puts "Stream error for session #{session_id}: #{event[:error]}"
+          elsif event.event_type == :error
+            @logger.error "Stream error for session #{session_id}: #{event.error}"
             dispatch_event_for_session(session_id, 'error', {
               source: 'stream',
-              error: event[:error]
+              error: event.error
             })
-          elsif event_type == :model_stream_error_exception
-            message = event.respond_to?(:message) ? event.message : "Unknown model stream error"
-            @logger.error "Model stream error for session #{session_id}: #{message}"
-            puts "Model stream error for session #{session_id}: #{message}"
-            
-            # Mark session for cleanup
-            session_data[:is_active] = false
-            
-            # Dispatch detailed error event
-            dispatch_event_for_session(session_id, 'error', {
-              source: 'model_stream',
-              error: message,
-              details: "AWS Bedrock returned a model stream error. This typically indicates an issue with the model or the input data format. Please check your audio format and AWS credentials."
-            })
-          elsif event_type == :initial_response
-            puts "Received initial_response event: #{event.inspect}"
-          elsif event_type == :complete
-            puts "Received complete event: #{event.inspect}"
-          else
-            puts "Unhandled event type: #{event_type}, data: #{event.inspect}"
           end
-        else
-          puts "Received non-standard event: #{event.inspect}"
+        # If it's an AWS SDK event class, handle appropriately
+        elsif defined?(Aws::BedrockRuntime::Types) && event.is_a?(Aws::BedrockRuntime::Types.const_get("ChunkEvent"))
+          puts "Event is a ChunkEvent"
+          if event.bytes
+            begin
+              response_data = JSON.parse(event.bytes)
+              
+              if response_data['event']
+                event_type = response_data['event'].keys.first
+                event_data = response_data['event'][event_type]
+                
+                # Dispatch based on event type
+                dispatch_event_for_session(session_id, event_type, event_data)
+              end
+            rescue JSON::ParserError => e
+              @logger.error "Failed to parse JSON response: #{e.message}"
+            end
+          end
+        # If it's a struct with a message property (likely an error)
+        elsif event.is_a?(Struct) && event.respond_to?(:message)
+          error_message = event.message
+          @logger.error "Error in stream for session #{session_id}: #{error_message}"
           
-          # Try to extract error information if it's an exception
-          if event.is_a?(Struct) && event.respond_to?(:message)
-            error_message = event.message
-            @logger.error "Non-standard error in stream for session #{session_id}: #{error_message}"
+          # Mark session for cleanup
+          session_data[:is_active] = false
+          
+          # Dispatch detailed error event
+          dispatch_event_for_session(session_id, 'error', {
+            source: 'aws_bedrock',
+            error: error_message,
+            details: "AWS Bedrock returned an error. This could be due to expired credentials, invalid audio format, or service issues."
+          })
+        # Handle all other cases
+        else
+          puts "Unknown event type: #{event.class}"
+          
+          # Try to infer event type if it responds to event_type
+          if event.respond_to?(:event_type)
+            puts "Event responds to event_type: #{event.event_type}"
+            event_type = event.event_type
             
-            # Mark session for cleanup
-            session_data[:is_active] = false
-            
-            # Dispatch detailed error event
-            dispatch_event_for_session(session_id, 'error', {
-              source: 'aws_bedrock',
-              error: error_message,
-              details: "AWS Bedrock returned an error. This could be due to expired credentials, invalid audio format, or service issues."
-            })
+            # Handle chunk events
+            if event_type == :chunk && event.respond_to?(:bytes)
+              begin
+                response_data = JSON.parse(event.bytes)
+                
+                if response_data['event']
+                  event_type = response_data['event'].keys.first
+                  event_data = response_data['event'][event_type]
+                  
+                  # Dispatch based on event type
+                  dispatch_event_for_session(session_id, event_type, event_data)
+                end
+              rescue JSON::ParserError => e
+                @logger.error "Failed to parse JSON response: #{e.message}"
+              end
+            # Handle error events
+            elsif event_type == :error && event.respond_to?(:error)
+              @logger.error "Stream error for session #{session_id}: #{event.error}"
+              dispatch_event_for_session(session_id, 'error', {
+                source: 'stream',
+                error: event.error
+              })
+            elsif event_type == :model_stream_error_exception
+              message = event.respond_to?(:message) ? event.message : "Unknown model stream error"
+              @logger.error "Model stream error for session #{session_id}: #{message}"
+              
+              # Mark session for cleanup
+              session_data[:is_active] = false
+              
+              # Dispatch detailed error event
+              dispatch_event_for_session(session_id, 'error', {
+                source: 'model_stream',
+                error: message,
+                details: "AWS Bedrock returned a model stream error."
+              })
+            elsif event_type == :initial_response
+              puts "Received initial_response event: #{event.inspect}"
+            elsif event_type == :complete
+              puts "Received complete event: #{event.inspect}"
+            else
+              puts "Unhandled event type: #{event_type}, data: #{event.inspect}"
+            end
+          else
+            puts "Event doesn't respond to event_type. Attempting to introspect..."
+            if event.respond_to?(:methods)
+              puts "Available methods: #{event.methods - Object.methods}"
+            end
           end
         end
       end
@@ -606,51 +806,29 @@ class NovaSonicBidirectionalStreamClient
     return unless session_data
     
     begin
-      puts "Starting to send queued events for session #{session_id}"
       # First send all initially queued events
       session_data[:queue_mutex].synchronize do
-        puts "Initial queue has #{session_data[:queue].size} events"
         session_data[:queue].each_with_index do |event, index|
-          # Events should already be JSON strings now
-          event_json = event
-          puts "Sending initial event #{index+1}/#{session_data[:queue].size} to Bedrock (length: #{event_json.length})"
-          puts "Event content (truncated): #{event_json[0..300]}..." if event_json.length > 300
-          
           begin
-            input_stream.signal_chunk_event(bytes: event_json)
-            puts "Successfully sent event #{index+1}"
+            input_stream.signal_chunk_event(bytes: event)
           rescue => e
-            puts "Error sending event #{index+1}: #{e.message}"
-            puts e.backtrace.join("\n")
+            @logger.error "Error sending event #{index+1}: #{e.message}"
             raise # Re-raise to exit the loop
           end
         end
         session_data[:queue].clear
-        puts "Cleared initial queue after sending events"
       end
       
       # Then wait for new events or close signal
-      puts "Starting event loop to wait for additional events"
-      loop_count = 0
-      loop do
-        loop_count += 1
-        
+      loop do        
         if !session_data[:is_active]
-          puts "Session #{session_id} is no longer active, exiting event loop"
           break
-        end
-        
-        # Replace Concurrent::Select with a simpler approach using Concurrent::Event#wait
-        # with a timeout to periodically check if we should still be running
-        if (loop_count % 100) == 0
-          puts "Still waiting for events in loop (iteration #{loop_count})"
         end
         
         event_triggered = session_data[:queue_signal].wait(0.1)
         
         # Check if we should close
         if !session_data[:is_active] || session_data[:close_signal].set?
-          puts "Detected close signal or inactive session, exiting event loop"
           break
         end
         
@@ -659,35 +837,22 @@ class NovaSonicBidirectionalStreamClient
           session_data[:queue_mutex].synchronize do
             queue_size = session_data[:queue].size
             return if queue_size == 0
-
-            puts "Processing #{queue_size} new events"
             
-            processed = 0
             while session_data[:is_active] && !session_data[:queue].empty?
               event = session_data[:queue].shift
-              processed += 1
-              
               event_json = event.to_json
-              puts "Sending queued event #{processed}/#{queue_size} (length: #{event_json.length})"
               
               begin
                 input_stream.signal_chunk_event(bytes: event_json)
-                puts "Successfully sent queued event #{processed}"
               rescue => e
-                puts "Error sending queued event: #{e.message}"
-                puts e.backtrace.join("\n")
-                # Don't re-raise here to allow processing of other events
+                @logger.error "Error sending queued event: #{e.message}"
               end
             end
           end
         end
       end
-      
-      puts "Event loop for session #{session_id} completed"
     rescue => e
-      puts "Critical error in send_queued_events for session #{session_id}: #{e.message}"
-      puts e.backtrace.join("\n")
-      @logger.error "Error in send_queued_events for session #{session_id}: #{e.message}"
+      @logger.error "Critical error in send_queued_events for session #{session_id}: #{e.message}"
     end
   end
   
@@ -699,23 +864,14 @@ class NovaSonicBidirectionalStreamClient
     update_session_activity(session_id)
     
     begin
-      puts "Processing response for session #{session_id}: #{response.inspect[0..300]}..."
-      
       if response['event']
-        puts "Event type: #{response['event'].keys.first}" if response['event'].keys.any?
-        
         if response['event']['contentStart']
-          puts "Dispatching contentStart event"
           dispatch_event_for_session(session_id, 'contentStart', response['event']['contentStart'])
         elsif response['event']['textOutput']
-          puts "Dispatching textOutput event: #{response['event']['textOutput']['content']}"
           dispatch_event_for_session(session_id, 'textOutput', response['event']['textOutput'])
         elsif response['event']['audioOutput']
-          content_length = response['event']['audioOutput']['content'].length
-          puts "Dispatching audioOutput event (#{content_length} bytes)"
           dispatch_event_for_session(session_id, 'audioOutput', response['event']['audioOutput'])
         elsif response['event']['toolUse']
-          puts "Dispatching toolUse event"
           dispatch_event_for_session(session_id, 'toolUse', response['event']['toolUse'])
           
           # Store tool use information for later
@@ -724,8 +880,6 @@ class NovaSonicBidirectionalStreamClient
           session_data[:tool_name] = response['event']['toolUse']['toolName']
         elsif response['event']['contentEnd'] && response['event']['contentEnd']['type'] == 'TOOL'
           # Process tool use
-          puts "Processing tool use for session #{session_id}"
-          @logger.info "Processing tool use for session #{session_id}"
           dispatch_event_for_session(session_id, 'toolEnd', {
             tool_use_content: session_data[:tool_use_content],
             tool_use_id: session_data[:tool_use_id],
@@ -745,7 +899,6 @@ class NovaSonicBidirectionalStreamClient
               result: tool_result
             })
           rescue => e
-            puts "Error processing tool use: #{e.message}"
             @logger.error "Error processing tool use: #{e.message}"
             dispatch_event_for_session(session_id, 'error', {
               source: 'tool_use',
@@ -753,25 +906,18 @@ class NovaSonicBidirectionalStreamClient
             })
           end
         elsif response['event']['contentEnd']
-          puts "Dispatching contentEnd event"
           dispatch_event_for_session(session_id, 'contentEnd', response['event']['contentEnd'])
         else
           # Handle other events
           event_keys = response['event'].keys
           if !event_keys.empty?
-            puts "Dispatching #{event_keys.first} event"
             dispatch_event_for_session(session_id, event_keys.first, response['event'])
           else
-            puts "Dispatching unknown event"
             dispatch_event_for_session(session_id, 'unknown', response)
           end
         end
-      else
-        puts "Response doesn't contain 'event' key: #{response.inspect}"
       end
     rescue => e
-      puts "Error processing response for session #{session_id}: #{e.message}"
-      puts e.backtrace.join("\n")
       @logger.error "Error processing response for session #{session_id}: #{e.message}"
     end
   end
@@ -1033,9 +1179,6 @@ class NovaSonicBidirectionalStreamClient
     # Convert audio to base64
     base64_data = Base64.strict_encode64(audio_data)
     
-    # Log audio data length for debugging
-    @logger.info "Sending audio chunk: #{audio_data.size} bytes raw, #{base64_data.length} bytes base64"
-    
     # Create the audio event in the exact format used in example.rb
     audio_event = {
       "event": {
@@ -1051,10 +1194,20 @@ class NovaSonicBidirectionalStreamClient
     begin
       # Send directly to the input stream
       session_data[:input_stream].signal_chunk_event(bytes: audio_event)
-      @logger.debug "Audio chunk sent to AWS"
     rescue => e
       @logger.error "Failed to send audio chunk: #{e.message}"
-      @logger.error e.backtrace.join("\n")
+      
+      # If connection is closed, mark session as inactive
+      if e.message.include?("Connection is closed")
+        @logger.error "Connection closed for session #{session_id}, marking as inactive"
+        session_data[:is_active] = false
+        dispatch_event_for_session(session_id, 'error', {
+          source: 'connection',
+          error: "Connection closed: #{e.message}",
+          recovery: "Please create a new session"
+        })
+      end
+      
       raise "Failed to send audio: #{e.message}"
     end
   end
@@ -1117,7 +1270,11 @@ class NovaSonicBidirectionalStreamClient
     session_data = @active_sessions[session_id]
     return unless session_data && session_data[:is_active]
     
-    puts "Sending contentEnd for session #{session_id}"
+    # Check if we have a valid input stream
+    if !session_data[:input_stream]
+      @logger.error "No input stream available for content end in session #{session_id}"
+      return
+    end
     
     event = {
       "event": {
@@ -1130,9 +1287,14 @@ class NovaSonicBidirectionalStreamClient
     
     begin
       session_data[:input_stream].signal_chunk_event(bytes: event)
-      puts "Content end event sent"
     rescue => e
-      puts "Error sending content end: #{e.message}"
+      @logger.error "Error sending content end: #{e.message}"
+      
+      # If connection is closed, mark session as inactive
+      if e.message.include?("Connection is closed")
+        @logger.error "Connection closed for session #{session_id}, marking as inactive"
+        session_data[:is_active] = false
+      end
     end
   end
   
@@ -1141,7 +1303,11 @@ class NovaSonicBidirectionalStreamClient
     session_data = @active_sessions[session_id]
     return unless session_data && session_data[:is_active]
     
-    puts "Sending promptEnd for session #{session_id}"
+    # Check if we have a valid input stream
+    if !session_data[:input_stream]
+      @logger.error "No input stream available for prompt end in session #{session_id}"
+      return
+    end
     
     event = {
       "event": {
@@ -1153,9 +1319,14 @@ class NovaSonicBidirectionalStreamClient
     
     begin
       session_data[:input_stream].signal_chunk_event(bytes: event)
-      puts "Prompt end event sent"
     rescue => e
-      puts "Error sending prompt end: #{e.message}"
+      @logger.error "Error sending prompt end: #{e.message}"
+      
+      # If connection is closed, mark session as inactive
+      if e.message.include?("Connection is closed")
+        @logger.error "Connection closed for session #{session_id}, marking as inactive"
+        session_data[:is_active] = false
+      end
     end
   end
   
@@ -1164,7 +1335,14 @@ class NovaSonicBidirectionalStreamClient
     session_data = @active_sessions[session_id]
     return unless session_data && session_data[:is_active]
     
-    puts "Sending sessionEnd for session #{session_id}"
+    # Check if we have a valid input stream
+    if !session_data[:input_stream]
+      @logger.error "No input stream available for session end in session #{session_id}"
+      session_data[:is_active] = false
+      @active_sessions.delete(session_id)
+      @session_last_activity.delete(session_id)
+      return
+    end
     
     event = {
       "event": {
@@ -1174,7 +1352,6 @@ class NovaSonicBidirectionalStreamClient
     
     begin
       session_data[:input_stream].signal_chunk_event(bytes: event)
-      puts "Session end event sent"
       
       # Close the input stream
       session_data[:input_stream].signal_end_stream
@@ -1183,34 +1360,28 @@ class NovaSonicBidirectionalStreamClient
       session_data[:is_active] = false
       @active_sessions.delete(session_id)
       @session_last_activity.delete(session_id)
-      
-      @logger.info "Session #{session_id} closed and removed from active sessions"
     rescue => e
-      puts "Error sending session end: #{e.message}"
+      @logger.error "Error sending session end: #{e.message}"
+      
+      # Ensure cleanup happens even if there's an error
+      session_data[:is_active] = false
+      @active_sessions.delete(session_id)
+      @session_last_activity.delete(session_id)
     end
   end
   
   # Dispatch events to handlers for a specific session
   def dispatch_event_for_session(session_id, event_type, data)
     session_data = @active_sessions[session_id]
-    if !session_data
-      puts "Cannot dispatch event: session #{session_id} not found"
-      return
-    end
+    return unless session_data
     
     stream_session = session_data[:stream_session]
-    if !stream_session
-      puts "Cannot dispatch event: stream_session for #{session_id} not found"
-      return
-    end
+    return unless stream_session
     
-    puts "Dispatching event #{event_type} to handlers for session #{session_id}"
     begin
       stream_session.handle_event(event_type, data)
-      puts "Event #{event_type} dispatched successfully"
     rescue => e
-      puts "Error dispatching event #{event_type}: #{e.message}"
-      puts e.backtrace.join("\n")
+      @logger.error "Error dispatching event #{event_type}: #{e.message}"
     end
   end
   
