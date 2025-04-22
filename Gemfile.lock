@@ -119,6 +119,7 @@ GEM
       raabro (~> 1.4)
     globalid (1.2.1)
       activesupport (>= 6.1)
+    http-2 (1.1.1)
     i18n (1.14.7)
       concurrent-ruby (~> 1.0)
     importmap-rails (2.1.0)
@@ -354,13 +355,12 @@ PLATFORMS
   x86_64-linux-musl
 
 DEPENDENCIES
-  aws-eventstream (~> 1.0)
   aws-sdk-bedrockruntime (~> 1.0)
-  aws-sdk-core (~> 3.0)
   bootsnap
   brakeman
   debug
   dotenv-rails
+  http-2
   importmap-rails
   kamal
   pg (~> 1.1)

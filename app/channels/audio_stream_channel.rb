@@ -1,18 +1,21 @@
 class AudioStreamChannel < ApplicationCable::Channel
   def subscribed
-    if params[:session_id].present?
-      @session_id = params[:session_id]
-      stream_from "audio_stream_#{@session_id}"
-      logger.info "Subscribed: #{@session_id}"
+    @session_id = params[:session_id] || SecureRandom.uuid # Get session ID from params or generate a new one
+    logger.info "<<< AudioStreamChannel attempting subscription for #{@session_id} >>>"
+
+    if @session_id
+      stream_from "audio_stream_channel_#{@session_id}"
+      logger.info "<<< AudioStreamChannel SUBSCRIBED for session: #{@session_id} >>>"
+      # Acknowledge successful subscription to the client
+      logger.info "<<< Preparing to transmit confirm_subscription for #{@session_id} >>>"
+      transmit({ type: 'confirm_subscription', message: 'Successfully connected', sessionId: @session_id })
+      logger.info "<<< Transmitted confirm_subscription for #{@session_id} >>>"
       
       # Initialize Nova Sonic client and session
       setup_nova_sonic_session
-      
-      # Acknowledge successful subscription to the client
-      transmit({ type: 'confirm_subscription', message: 'Successfully connected' })
     else
       logger.error "Rejected subscription: missing session_id"
-      reject
+      reject_subscription # Reject if no session ID
     end
   end
 
@@ -67,7 +70,6 @@ class AudioStreamChannel < ApplicationCable::Channel
         transmit({ type: 'error', message: 'No active session' })
         return
       end
-      @nova_sonic_client.setup_start_audio_event(@session_id)
       transmit({ type: 'audio_started', message: 'Audio streaming initialized' })
     when 'audio_input'
       if message_data['audio_data'].present?
@@ -178,16 +180,21 @@ class AudioStreamChannel < ApplicationCable::Channel
   end
 
   def cleanup_nova_sonic_session
-    return unless @session
+    return unless @session && @nova_sonic_client # Check both exist
 
     begin
-      @session.end_audio_content
-      @session.end_prompt
-      @session.close
-      logger.info "Session cleanup complete: #{@session_id}"
+      # Only explicitly end the current audio content block if needed.
+      # The input stream itself remains open for continuous interaction.
+      @session.end_audio_content # Send contentEnd for the last audio segment
+      # Remove the call that signals the end of the entire input stream
+      # @nova_sonic_client.signal_input_stream_end(@session_id)
+      logger.info "Requested cleanup for session #{@session_id}: Sent contentEnd for last audio block."
     rescue => e
-      logger.error "Error during session cleanup: #{e.message}"
+      logger.error "Error during session cleanup request for #{@session_id}: #{e.message}"
     ensure
+      # Only nullify references here; actual client-side session object removal
+      # happens in the client's finalize_session method when an error occurs
+      # or potentially via a specific "close" request from the client.
       @session = nil
       @nova_sonic_client = nil
     end
