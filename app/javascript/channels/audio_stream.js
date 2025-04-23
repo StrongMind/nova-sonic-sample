@@ -267,31 +267,10 @@ class AudioPlayer {
       this.initialized = true;
       console.log("AudioPlayer initialized successfully");
       
-      // Test with a short beep sound to verify audio playback works
-      this.playTestSound();
+      // Removed test beep sound
     } catch (error) {
       console.error("Error initializing AudioPlayer:", error);
       throw error;
-    }
-  }
-
-  async playTestSound() {
-    try {
-      // Create a short beep sound
-      const duration = 0.3; // seconds
-      const frequency = 440; // Hz
-      const sampleRate = this.audioContext.sampleRate;
-      const samples = new Float32Array(Math.floor(duration * sampleRate));
-      
-      // Generate a sine wave
-      for (let i = 0; i < samples.length; i++) {
-        samples[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 0.5;
-      }
-      
-      console.log("Playing test sound...");
-      this.playAudio(samples);
-    } catch (error) {
-      console.error("Error playing test sound:", error);
     }
   }
 
@@ -511,6 +490,19 @@ function connect() {
           console.log(`Processing ${data.size} bytes of audio data in ${data.format} format`);
         }
         
+        // Handle session recreation messages
+        else if (data.type === 'session_recreated' || data.type === 'session_recovered') {
+          console.log("Session status:", data.message);
+          // If recording is in progress, ensure we continue
+          if (recorder && recorder.state === 'recording') {
+            console.log("Continuing recording with new session");
+          } else {
+            console.log("Session is ready for new recording");
+            document.getElementById('startButton').disabled = false;
+            document.getElementById('stopButton').disabled = true;
+          }
+        }
+        
         // Handle chunk events from Bedrock
         else if (data.type === 'chunk') {
           console.log("Received chunk data:", data);
@@ -655,6 +647,48 @@ function connect() {
           }
           chatHistory.appendChild(errorDiv);
           chatHistory.scrollTop = chatHistory.scrollHeight;
+          
+          // Handle specific validation errors that require reconnection
+          if (data.message.includes('session needs to be restarted') ||
+              data.message.includes('Failed to recreate session') ||
+              (data.details && (
+                data.details.includes('ValidationException') ||
+                data.details.includes('Connection is closed due to errors')
+              ))) {
+            console.log("Detected validation error, will attempt to reset session");
+            
+            // If we're currently recording, we need to restart
+            if (recorder && recorder.state === 'recording') {
+              console.log("Stopping current recording due to validation error");
+              stopRecording();
+              
+              // Wait briefly then show a notification to restart
+              setTimeout(() => {
+                const chatHistory = document.getElementById('chatHistory');
+                const noticeDiv = document.createElement('div');
+                noticeDiv.className = 'message system';
+                noticeDiv.textContent = "Please try speaking again.";
+                chatHistory.appendChild(noticeDiv);
+                chatHistory.scrollTop = chatHistory.scrollHeight;
+                
+                // Re-enable the start button
+                document.getElementById('startButton').disabled = false;
+              }, 1000);
+            }
+          }
+        }
+        
+        // Handle content end events
+        else if (data.type === 'contentEnd') {
+          console.log("Received contentEnd event:", data);
+          
+          // If this is a complete turn (END_TURN), prepare for next interaction
+          if (data.data && 
+              data.data.event && 
+              data.data.event.contentEnd && 
+              data.data.event.contentEnd.stopReason === "END_TURN") {
+            console.log("End of turn detected, ready for next interaction");
+          }
         }
         
         // Handle any other messages for display
@@ -690,13 +724,25 @@ async function startRecording() {
     return;
   }
 
-  // Send audio_start event before starting recording
-  subscription.send({
-    type: 'audio_start',
-    session_id: window.sessionId
-  });
+  // If we already have a recorder, clean it up
+  if (recorder && recorder.state === 'recording') {
+    console.log("Stopping existing recording before starting new one");
+    stopRecording();
+    // Small delay to ensure cleanup
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
 
   try {
+    // Signal to the server we're starting a new audio stream
+    console.log("Sending audio_start event");
+    subscription.send({
+      type: 'audio_start',
+      session_id: window.sessionId
+    });
+
+    // Give a short delay for the server to initialize
+    await new Promise(resolve => setTimeout(resolve, 250));
+
     // Get microphone access
     audioStream = await navigator.mediaDevices.getUserMedia({ 
       audio: {
@@ -770,11 +816,21 @@ async function startRecording() {
       }
     };
     
+    // If we have an audio player, do a barge-in
+    if (audioPlayer && audioPlayer.initialized) {
+      console.log("Performing barge-in on existing audio playback");
+      audioPlayer.bargeIn();
+    }
+    
     document.getElementById('startButton').disabled = true;
     document.getElementById('stopButton').disabled = false;
   } catch (error) {
     console.error('Error accessing microphone:', error);
     alert('Error accessing microphone. Please ensure you have granted microphone permissions.');
+    
+    // Re-enable the start button on error
+    document.getElementById('startButton').disabled = false;
+    document.getElementById('stopButton').disabled = true;
   }
 }
 
@@ -789,18 +845,24 @@ function arrayBufferToBase64(buffer) {
 
 function stopRecording() {
   if (recorder && recorder.state === 'recording') {
+    console.log("Stopping recording");
     recorder.stop();
     
     if (audioStream) {
       audioStream.getTracks().forEach(track => track.stop());
+      audioStream = null;
     }
     
     if (subscription) {
+      console.log("Sending stop_audio event");
       subscription.send({
         type: 'stop_audio',
         session_id: window.sessionId
       });
     }
+    
+    // Clean up recorder
+    recorder = null;
     
     document.getElementById('startButton').disabled = false;
     document.getElementById('stopButton').disabled = true;

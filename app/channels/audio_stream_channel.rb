@@ -32,7 +32,6 @@ class AudioStreamChannel < ApplicationCable::Channel
   end
 
   def receive(data)
-   
     # Handle the WebSocket message format
     message_data = if data.is_a?(String)
       begin
@@ -71,17 +70,37 @@ class AudioStreamChannel < ApplicationCable::Channel
       setup_system_prompt(message_data['content'])
     when 'audio_start'
       logger.info "Processing audio_start for session #{@session_id}"
-      if @session.nil?
-        logger.info "No active session found for audio_start, creating new session"
-        setup_nova_sonic_session
+      # Always try to establish a fresh session for audio_start
+      begin
+        if @session.nil? || @nova_sonic_client.nil?
+          logger.info "No active session found for audio_start, creating new session"
+          setup_nova_sonic_session
+        end
+        setup_audio_start
+        transmit({ type: 'audio_started', message: 'Audio streaming initialized' })
+      rescue => e
+        logger.error "Failed to start audio session: #{e.message}"
+        
+        # Force a complete reset of the session
+        @session = nil
+        @nova_sonic_client = nil
+        
+        # Try one more time with a clean session
+        begin
+          logger.info "Retrying session creation after failure"
+          setup_nova_sonic_session
+          setup_audio_start
+          transmit({ type: 'audio_started', message: 'Audio streaming initialized on retry' })
+        rescue => retry_error
+          logger.error "Retry failed for audio_start: #{retry_error.message}"
+          transmit({ type: 'error', message: 'Failed to start audio session', details: retry_error.message })
+        end
       end
-      setup_audio_start
-      transmit({ type: 'audio_started', message: 'Audio streaming initialized' })
     when 'audio_input'
       if message_data['audio_data'].present?
-        #logger.info "Processing audio_input for session #{@session_id}"
-        if @session.nil?
-          logger.info "No active session for audio_input, attempting to recreate session"
+        # Check if we need to recreate the session
+        if @session.nil? || @nova_sonic_client.nil?
+          logger.info "No active session for audio_input, recreating session"
           begin
             setup_nova_sonic_session
             # Give the session a moment to initialize
@@ -102,7 +121,35 @@ class AudioStreamChannel < ApplicationCable::Channel
           logger.debug "Stripping data URL prefix from audio data"
           audio_data = audio_data.split(',', 2).last
         end
-        stream_audio(audio_data)
+        
+        # Check if we need to restart audio streaming
+        begin
+          stream_audio(audio_data)
+        rescue => e
+          if e.message.include?("ValidationException") || 
+             e.message.include?("Connection is closed due to errors")
+            
+            logger.warn "Validation error during audio streaming, attempting recovery"
+            
+            # Reset session and try again
+            @session = nil
+            @nova_sonic_client = nil
+            
+            # Try to recreate and resume
+            begin
+              setup_nova_sonic_session
+              setup_audio_start
+              stream_audio(audio_data) # Try again with same audio
+              transmit({ type: 'session_recovered', message: 'Audio session was recovered' })
+            rescue => recovery_error
+              logger.error "Failed to recover session: #{recovery_error.message}"
+              transmit({ type: 'error', message: 'Failed to recover audio session', details: recovery_error.message })
+            end
+          else
+            # Pass through other errors
+            raise e
+          end
+        end
       else
         logger.error "Received empty audio data for session #{@session_id}"
         transmit({ type: 'error', message: 'Empty audio data received' })
@@ -114,6 +161,10 @@ class AudioStreamChannel < ApplicationCable::Channel
       logger.error "Unknown message type for session #{@session_id}: #{message_data['type']}"
       transmit({ type: 'error', message: "Unknown message type: #{message_data['type']}" })
     end
+  rescue => e
+    logger.error "Error processing message: #{e.message}"
+    logger.error e.backtrace.join("\n")
+    transmit({ type: 'error', message: 'Error processing message', details: e.message })
   end
 
   private
@@ -485,7 +536,16 @@ class AudioStreamChannel < ApplicationCable::Channel
         logger.error "Error streaming audio to session: #{stream_error.message}"
         logger.error stream_error.backtrace.join("\n")
         
-        # Close the session on error and restart
+        # Handle validation errors specifically
+        if stream_error.message.include?("ValidationException") || 
+           stream_error.message.include?("Connection is closed due to errors") ||
+           stream_error.is_a?(Aws::BedrockRuntime::Types::ValidationException)
+          
+          handle_session_validation_error(stream_error.message)
+          return
+        end
+        
+        # For other errors, attempt standard session restart
         logger.info "Attempting to restart the session after error"
         cleanup_nova_sonic_session
         transmit({ 
@@ -520,17 +580,41 @@ class AudioStreamChannel < ApplicationCable::Channel
       # Only explicitly end the current audio content block if needed.
       # The input stream itself remains open for continuous interaction.
       @session.end_audio_content # Send contentEnd for the last audio segment
-      # Remove the call that signals the end of the entire input stream
-      # @nova_sonic_client.signal_input_stream_end(@session_id)
       logger.info "Requested cleanup for session #{@session_id}: Sent contentEnd for last audio block."
     rescue => e
       logger.error "Error during session cleanup request for #{@session_id}: #{e.message}"
+      # If we get a validation exception, we need to recreate the session
+      if e.message.include?("ValidationException") || e.message.include?("Connection is closed due to errors")
+        logger.info "Detected validation exception, will recreate session on next interaction"
+        # Force session recreation on next interaction
+        @session = nil
+        @nova_sonic_client = nil
+      end
+    end
+  end
+
+  # Add a method to handle session recovery after validation errors
+  def handle_session_validation_error(error_message)
+    logger.warn "Validation error occurred: #{error_message}"
+    
+    # Force session cleanup
+    begin
+      if @session
+        @session.close rescue nil
+      end
+    rescue => e
+      logger.warn "Error during forced session cleanup: #{e.message}"
     ensure
-      # Only nullify references here; actual client-side session object removal
-      # happens in the client's finalize_session method when an error occurs
-      # or potentially via a specific "close" request from the client.
+      # Make sure we reset these references
       @session = nil
       @nova_sonic_client = nil
     end
+    
+    # Send error notification to client
+    transmit({ 
+      type: 'error',
+      message: 'Speech session needs to be restarted',
+      details: 'The connection with AWS Bedrock speech service was interrupted. Please try speaking again.'
+    })
   end
 end 
