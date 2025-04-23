@@ -6,13 +6,15 @@ let subscription = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
-// ---------------- Audio Player Implementation ----------------
-// Implementation based on the approach in node-example/public/src/main.js
-let audioContext = null;
-let audioWorkletNode = null;
-let audioInitialized = false;
+// Track processed messages to prevent duplicates
+let processedTextMessages = new Set();
+let processedAudioMessages = new Set();
 
-// Base64 to Float32Array conversion (same as in main.js)
+// ---------------- Audio Player Implementation ----------------
+// Using the AudioPlayer class from the node-example
+let audioPlayer = null;
+
+// Base64 to Float32Array conversion
 function base64ToFloat32Array(base64String) {
   try {
     const binaryString = window.atob(base64String);
@@ -27,6 +29,7 @@ function base64ToFloat32Array(base64String) {
       float32Array[i] = int16Array[i] / 32768.0;
     }
 
+    console.log(`Converted base64 to Float32Array, length: ${float32Array.length}, sample values: ${float32Array.slice(0, 5)}`);
     return float32Array;
   } catch (error) {
     console.error('Error in base64ToFloat32Array:', error);
@@ -34,77 +37,418 @@ function base64ToFloat32Array(base64String) {
   }
 }
 
-// Initialize audio context for playback
-async function initAudioPlayer() {
-  if (audioInitialized) return;
-  
-  try {
-    // Check default system sample rate first
-    const tempContext = new (window.AudioContext || window.webkitAudioContext)();
-    const systemSampleRate = tempContext.sampleRate;
-    tempContext.close();
-    
-    console.log(`System audio sample rate: ${systemSampleRate}Hz, Bedrock audio sample rate: 16000Hz`);
-    
-    // Always try to use 16000Hz to match Bedrock's output
-    // On some browsers this may be overridden to the system rate
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 16000 // Match Bedrock's output sample rate
-    });
-    
-    console.log(`Actual audio context sample rate: ${audioContext.sampleRate}Hz`);
-    
-    // Create a simple gain node for volume control
-    const gainNode = audioContext.createGain();
-    gainNode.gain.value = 1.0; // Set volume to 100%
-    gainNode.connect(audioContext.destination);
-    
-    audioInitialized = true;
-    console.log("Audio player initialized successfully");
-    return gainNode;
-  } catch (error) {
-    console.error("Failed to initialize audio player:", error);
-    return null;
+// Import the AudioPlayer and ObjectExt classes
+class ObjectExt {
+  static exists(obj) {
+    return obj !== undefined && obj !== null;
   }
 }
 
-// Play audio using the simple player
-async function playAudio(float32AudioData) {
-  if (!audioInitialized) {
-    await initAudioPlayer();
+// ExpandableBuffer implementation for AudioPlayerProcessor worklet
+const audioPlayerProcessorCode = `
+// Audio sample buffer to minimize reallocations
+class ExpandableBuffer {
+  constructor() {
+    // Start with one second's worth of buffered audio capacity before needing to expand
+    this.buffer = new Float32Array(24000);
+    this.readIndex = 0;
+    this.writeIndex = 0;
+    this.underflowedSamples = 0;
+    this.isInitialBuffering = true;
+    this.initialBufferLength = 24000;  // One second
+    this.lastWriteTime = 0;
+  }
+
+  logTimeElapsedSinceLastWrite() {
+    const now = Date.now();
+    if (this.lastWriteTime !== 0) {
+      const elapsed = now - this.lastWriteTime;
+      console.log(\`Elapsed time since last audio buffer write: \${elapsed} ms\`);
+    }
+    this.lastWriteTime = now;
+  }
+
+  write(samples) {
+    this.logTimeElapsedSinceLastWrite();
+    if (this.writeIndex + samples.length <= this.buffer.length) {
+      // Enough space to append the new samples
+    }
+    else {
+      // Not enough space ...
+      if (samples.length <= this.readIndex) {
+        // ... but we can shift samples to the beginning of the buffer
+        const subarray = this.buffer.subarray(this.readIndex, this.writeIndex);
+        console.log(\`Shifting the audio buffer of length \${subarray.length} by \${this.readIndex}\`);
+        this.buffer.set(subarray);
+      }
+      else {
+        // ... and we need to grow the buffer capacity to make room for more audio
+        const newLength = (samples.length + this.writeIndex - this.readIndex) * 2;
+        const newBuffer = new Float32Array(newLength);
+        console.log(\`Expanding the audio buffer from \${this.buffer.length} to \${newLength}\`);
+        newBuffer.set(this.buffer.subarray(this.readIndex, this.writeIndex));
+        this.buffer = newBuffer;
+      }
+      this.writeIndex -= this.readIndex;
+      this.readIndex = 0;
+    }
+    this.buffer.set(samples, this.writeIndex);
+    this.writeIndex += samples.length;
+    if (this.writeIndex - this.readIndex >= this.initialBufferLength) {
+      // Filled the initial buffer length, so we can start playback with some cushion
+      this.isInitialBuffering = false;
+      console.log("Initial audio buffer filled");
+    }
+  }
+
+  read(destination) {
+    let copyLength = 0;
+    if (!this.isInitialBuffering) {
+      // Only start to play audio after we've built up some initial cushion
+      copyLength = Math.min(destination.length, this.writeIndex - this.readIndex);
+    }
+    destination.set(this.buffer.subarray(this.readIndex, this.readIndex + copyLength));
+    this.readIndex += copyLength;
+    if (copyLength > 0 && this.underflowedSamples > 0) {
+      console.log(\`Detected audio buffer underflow of \${this.underflowedSamples} samples\`);
+      this.underflowedSamples = 0;
+    }
+    if (copyLength < destination.length) {
+      // Not enough samples (buffer underflow). Fill the rest with silence.
+      destination.fill(0, copyLength);
+      this.underflowedSamples += destination.length - copyLength;
+    }
+    if (copyLength === 0) {
+      // Ran out of audio, so refill the buffer to the initial length before playing more
+      this.isInitialBuffering = true;
+    }
+  }
+
+  clearBuffer() {
+    this.readIndex = 0;
+    this.writeIndex = 0;
+  }
+}
+
+class AudioPlayerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.playbackBuffer = new ExpandableBuffer();
+    this.port.onmessage = (event) => {
+      if (event.data.type === "audio") {
+        this.playbackBuffer.write(event.data.audioData);
+      }
+      else if (event.data.type === "initial-buffer-length") {
+        // Override the current playback initial buffer length
+        const newLength = event.data.bufferLength;
+        this.playbackBuffer.initialBufferLength = newLength;
+        console.log(\`Changed initial audio buffer length to: \${newLength}\`)
+      }
+      else if (event.data.type === "barge-in") {
+        this.playbackBuffer.clearBuffer();
+      }
+    };
+  }
+
+  process(inputs, outputs, parameters) {
+    const output = outputs[0][0]; // Assume one output with one channel
+    this.playbackBuffer.read(output);
+    return true; // True to continue processing
+  }
+}
+
+registerProcessor("audio-player-processor", AudioPlayerProcessor);
+`;
+
+// Audio recorder worklet processor code
+const audioRecorderProcessorCode = `
+class AudioRecorderProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.isRecording = false;
+    
+    this.port.onmessage = (event) => {
+      if (event.data.type === "start-recording") {
+        this.isRecording = true;
+      } else if (event.data.type === "stop-recording") {
+        this.isRecording = false;
+      }
+    };
+  }
+
+  process(inputs, outputs, parameters) {
+    // If we're not recording or there's no input, just return
+    if (!this.isRecording || !inputs[0] || !inputs[0][0] || inputs[0][0].length === 0) {
+      return true;
+    }
+
+    // Get the input data
+    const inputData = inputs[0][0];
+    
+    // Convert to 16-bit PCM
+    const pcmData = new Int16Array(inputData.length);
+    for (let i = 0; i < inputData.length; i++) {
+      pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+    }
+    
+    // Send the data to the main thread
+    this.port.postMessage({
+      type: "audio-data",
+      audioData: pcmData.buffer
+    }, [pcmData.buffer]); // Transfer the buffer to avoid copying
+    
+    return true;
+  }
+}
+
+registerProcessor("audio-recorder-processor", AudioRecorderProcessor);
+`;
+
+// AudioPlayer class implementation
+class AudioPlayer {
+  constructor() {
+    this.onAudioPlayedListeners = [];
+    this.initialized = false;
+  }
+
+  addEventListener(event, callback) {
+    switch (event) {
+      case "onAudioPlayed":
+        this.onAudioPlayedListeners.push(callback);
+        break;
+      default:
+        console.error("Listener registered for event type: " + JSON.stringify(event) + " which is not supported");
+    }
+  }
+
+  async start() {
+    try {
+      console.log("Starting AudioPlayer initialization...");
+      // Use 16000 Hz for compatibility with Bedrock's output
+      this.audioContext = new AudioContext({ "sampleRate": 16000 });
+      console.log(`AudioContext created with sample rate: ${this.audioContext.sampleRate}`);
+      
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 512;
+      console.log("Analyzer created with fftSize:", this.analyser.fftSize);
+
+      // Create a Blob from the processor code
+      const blob = new Blob([audioPlayerProcessorCode], { type: 'application/javascript' });
+      const workletUrl = URL.createObjectURL(blob);
+      console.log("Created worklet URL:", workletUrl);
+
+      // Add the module to the audio context
+      console.log("Adding audio worklet module...");
+      await this.audioContext.audioWorklet.addModule(workletUrl);
+      console.log("Audio worklet module added successfully");
+      
+      console.log("Creating AudioWorkletNode...");
+      this.workletNode = new AudioWorkletNode(this.audioContext, "audio-player-processor");
+      console.log("Connecting audio nodes...");
+      this.workletNode.connect(this.analyser);
+      this.analyser.connect(this.audioContext.destination);
+      console.log("Audio nodes connected");
+      
+      // This section uses deprecated ScriptProcessorNode - keeping for backwards compatibility
+      // but it's not used for the main audio playback functionality
+      this.recorderNode = this.audioContext.createScriptProcessor(512, 1, 1);
+      this.recorderNode.onaudioprocess = (event) => {
+        // Pass the input along as-is
+        const inputData = event.inputBuffer.getChannelData(0);
+        const outputData = event.outputBuffer.getChannelData(0);
+        outputData.set(inputData);
+        // Notify listeners that the audio was played
+        const samples = new Float32Array(outputData.length);
+        samples.set(outputData);
+        this.onAudioPlayedListeners.forEach(listener => listener(samples));
+      }
+      
+      this.maybeOverrideInitialBufferLength();
+      this.initialized = true;
+      console.log("AudioPlayer initialized successfully");
+      
+      // Test with a short beep sound to verify audio playback works
+      this.playTestSound();
+    } catch (error) {
+      console.error("Error initializing AudioPlayer:", error);
+      throw error;
+    }
+  }
+
+  async playTestSound() {
+    try {
+      // Create a short beep sound
+      const duration = 0.3; // seconds
+      const frequency = 440; // Hz
+      const sampleRate = this.audioContext.sampleRate;
+      const samples = new Float32Array(Math.floor(duration * sampleRate));
+      
+      // Generate a sine wave
+      for (let i = 0; i < samples.length; i++) {
+        samples[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 0.5;
+      }
+      
+      console.log("Playing test sound...");
+      this.playAudio(samples);
+    } catch (error) {
+      console.error("Error playing test sound:", error);
+    }
+  }
+
+  bargeIn() {
+    if (this.workletNode) {
+      console.log("Sending barge-in message to worklet");
+      this.workletNode.port.postMessage({
+        type: "barge-in",
+      });
+    }
+  }
+
+  stop() {
+    console.log("Stopping AudioPlayer...");
+    if (ObjectExt.exists(this.audioContext)) {
+      this.audioContext.close();
+    }
+
+    if (ObjectExt.exists(this.analyser)) {
+      this.analyser.disconnect();
+    }
+
+    if (ObjectExt.exists(this.workletNode)) {
+      this.workletNode.disconnect();
+    }
+
+    if (ObjectExt.exists(this.recorderNode)) {
+      this.recorderNode.disconnect();
+    }
+
+    this.initialized = false;
+    this.audioContext = null;
+    this.analyser = null;
+    this.workletNode = null;
+    this.recorderNode = null;
+    console.log("AudioPlayer stopped");
+  }
+
+  maybeOverrideInitialBufferLength() {
+    // Read a user-specified initial buffer length from the URL parameters to help with tinkering
+    const params = new URLSearchParams(window.location.search);
+    const value = params.get("audioPlayerInitialBufferLength");
+    if (value === null) {
+      // Set a default buffer length (shorter for faster response)
+      this.workletNode.port.postMessage({
+        type: "initial-buffer-length",
+        bufferLength: 4800, // 0.3 seconds at 16kHz
+      });
+      console.log("Using default initial buffer length: 4800 samples");
+      return;
+    }
+    const bufferLength = parseInt(value);
+    if (isNaN(bufferLength)) {
+      console.error("Invalid audioPlayerInitialBufferLength value:", JSON.stringify(value));
+      return;
+    }
+    this.workletNode.port.postMessage({
+      type: "initial-buffer-length",
+      bufferLength: bufferLength,
+    });
+    console.log(`Set custom initial buffer length: ${bufferLength}`);
+  }
+
+  playAudio(samples) {
+    if (!this.initialized) {
+      console.error("The audio player is not initialized. Call start() before attempting to play audio.");
+      return;
+    }
+    
+    // Resume the audio context if it's suspended (browsers require user interaction)
+    if (this.audioContext.state === 'suspended') {
+      console.log("Resuming suspended audio context...");
+      this.audioContext.resume().then(() => {
+        console.log("AudioContext resumed successfully");
+        this._sendAudioToWorklet(samples);
+      }).catch(err => {
+        console.error("Failed to resume AudioContext:", err);
+      });
+    } else {
+      this._sendAudioToWorklet(samples);
+    }
   }
   
-  if (!audioContext) {
-    console.error("Audio context not available");
+  _sendAudioToWorklet(samples) {
+    console.log(`Sending ${samples.length} audio samples to worklet`);
+    // Log some stats about the audio data
+    let nonZeroCount = 0;
+    let min = 1, max = -1;
+    for (let i = 0; i < Math.min(1000, samples.length); i++) {
+      if (samples[i] !== 0) nonZeroCount++;
+      min = Math.min(min, samples[i]);
+      max = Math.max(max, samples[i]);
+    }
+    console.log(`Audio stats: non-zero samples: ${nonZeroCount}/1000, range: ${min.toFixed(4)} to ${max.toFixed(4)}`);
+    
+    // ONLY use one playback method - we previously had two running simultaneously
+    // Use the AudioWorkletNode for playback
+    this.workletNode.port.postMessage({
+      type: "audio",
+      audioData: samples,
+    });
+  }
+
+  getVolume() {
+    if (!this.initialized) {
+      return 0;
+    }
+    const bufferLength = this.analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    this.analyser.getByteTimeDomainData(dataArray);
+    let normSamples = [...dataArray].map(e => e / 128 - 1);
+    let sum = 0;
+    for (let i = 0; i < normSamples.length; i++) {
+      sum += normSamples[i] * normSamples[i];
+    }
+    return Math.sqrt(sum / normSamples.length);
+  }
+}
+
+// Initialize audio player
+async function initAudioPlayer() {
+  if (audioPlayer && audioPlayer.initialized) return true;
+  
+  try {
+    console.log("Initializing audio player...");
+    audioPlayer = new AudioPlayer();
+    await audioPlayer.start();
+    console.log("Audio player initialized successfully");
+    return true;
+  } catch (error) {
+    console.error("Failed to initialize audio player:", error);
+    return false;
+  }
+}
+
+// Simplified playAudio function that uses the AudioPlayer class
+async function playAudio(float32AudioData) {
+  console.log(`playAudio called with ${float32AudioData.length} samples`);
+  
+  if (!float32AudioData || float32AudioData.length === 0) {
+    console.error("Received empty audio data");
     return;
   }
   
-  try {
-    const bedrockSampleRate = 16000;
-    const outputSampleRate = audioContext.sampleRate;
-    
-    // If the sample rates don't match, we need to resample
-    if (bedrockSampleRate !== outputSampleRate) {
-      console.warn(`Audio sample rate mismatch: Bedrock sample rate is ${bedrockSampleRate}Hz, but audio context sample rate is ${outputSampleRate}Hz`);
+  if (!audioPlayer || !audioPlayer.initialized) {
+    console.log("AudioPlayer not initialized, initializing now...");
+    const success = await initAudioPlayer();
+    if (!success) {
+      console.error("Failed to initialize audio player");
+      return;
     }
-    
-    // Create an audio buffer with the audio data
-    const audioBuffer = audioContext.createBuffer(1, float32AudioData.length, outputSampleRate);
-    const channelData = audioBuffer.getChannelData(0);
-    
-    // Copy the float32 audio data to the buffer
-    channelData.set(float32AudioData);
-    
-    // Create a buffer source
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    
-    // Connect to the audio context destination
-    source.connect(audioContext.destination);
-    
-    // Start playing
-    source.start();
-    console.log("Audio playback started with sample rate:", outputSampleRate);
+  }
+  
+  try {
+    console.log("Playing audio...");
+    audioPlayer.playAudio(float32AudioData);
+    console.log("Audio playback started with sample count:", float32AudioData.length);
   } catch (error) {
     console.error("Error playing audio:", error);
   }
@@ -153,7 +497,7 @@ function connect() {
         updateConnectionStatus('Connection rejected', false);
       },
 
-      received(data) {
+      async received(data) {
         console.log("Received data:", data);
         
         // Handle subscription confirmation
@@ -191,17 +535,32 @@ function connect() {
           
           // Handle both formats: direct content or nested event structure
           let content = '';
+          let messageId = '';
+          
           if (data.data && data.data.event && data.data.event.textOutput) {
             content = data.data.event.textOutput.content;
+            // Try to get a message ID from the data
+            messageId = data.data.event.id || data.data.id || JSON.stringify(data.data.event.textOutput).substring(0, 100);
           } else if (data.data && data.data.content) {
             content = data.data.content;
+            messageId = data.data.id || JSON.stringify(data.data).substring(0, 100);
           } else if (data.data) {
             // If we can't find content in expected places, log the data and use stringified version
             console.warn("Unexpected textOutput structure:", data.data);
             content = JSON.stringify(data.data);
+            messageId = JSON.stringify(data.data).substring(0, 100);
           }
           
-          if (content) {
+          // Check if we've already processed this message to prevent duplicates
+          if (content && messageId) {
+            if (processedTextMessages.has(messageId)) {
+              console.log("Skipping duplicate text message:", messageId);
+              return;
+            }
+            
+            // Add to processed messages
+            processedTextMessages.add(messageId);
+            
             const chatHistory = document.getElementById('chatHistory');
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message assistant';
@@ -213,21 +572,28 @@ function connect() {
         
         // Handle audio output from Bedrock model
         else if (data.type === 'audioOutput') {
-          console.log("Received audio output");
+          console.log("Received audio output data");
           
           // Get audio content, handling different possible structures
           let audioContent = '';
+          let audioId = '';
+          
           if (data.data && data.data.event && data.data.event.audioOutput) {
             const audioOutput = data.data.event.audioOutput;
             audioContent = audioOutput.content;
+            // Try to get an ID for deduplication
+            audioId = data.data.event.id || data.data.id || audioOutput.content.substring(0, 50);
+            
             console.log("Audio configuration:", audioOutput.mediaType, 
                       audioOutput.sampleRateHertz, 
                       audioOutput.sampleSizeBits, 
                       audioOutput.channelCount);
           } else if (data.data && data.data.content) {
             audioContent = data.data.content;
+            audioId = data.data.id || data.data.content.substring(0, 50);
           } else if (data.data) {
             console.warn("Unexpected audioOutput structure:", data.data);
+            console.log("Raw audioOutput data:", JSON.stringify(data));
             return; // Can't process audio without proper content
           }
           
@@ -236,11 +602,38 @@ function connect() {
             return;
           }
           
+          // Check if we've already processed this audio to prevent duplicates
+          if (processedAudioMessages.has(audioId)) {
+            console.log("Skipping duplicate audio message:", audioId);
+            return;
+          }
+          
+          // Add to processed messages
+          processedAudioMessages.add(audioId);
+          
+          console.log(`Received audio content (length: ${audioContent.length})`);
+          
           try {
-            // Using the same approach as in main.js
+            // Convert base64 to audio data and play it
             const audioData = base64ToFloat32Array(audioContent);
+            
+            if (audioData.length === 0) {
+              console.error("Converted audio data is empty");
+              return;
+            }
+            
+            // Ensure audio context is in running state
+            if (audioPlayer && audioPlayer.audioContext && audioPlayer.audioContext.state === 'suspended') {
+              console.log("Audio context is suspended, attempting to resume...");
+              try {
+                await audioPlayer.audioContext.resume();
+                console.log("Audio context resumed successfully");
+              } catch (err) {
+                console.error("Failed to resume audio context:", err);
+              }
+            }
+            
             playAudio(audioData);
-            console.log("Audio playback started with sample count:", audioData.length);
           } catch (error) {
             console.error("Error processing audio:", error, error.stack);
           }
@@ -291,7 +684,7 @@ function appendMessage(message) {
   chatHistory.scrollTop = chatHistory.scrollHeight;
 }
 
-function startRecording() {
+async function startRecording() {
   if (!subscription) {
     console.error("No active subscription");
     return;
@@ -303,41 +696,50 @@ function startRecording() {
     session_id: window.sessionId
   });
 
-  navigator.mediaDevices.getUserMedia({ 
-    audio: {
-      sampleRate: 16000,
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    }
-  })
-    .then(stream => {
-      audioStream = stream;
-      
-      // Create AudioContext for processing audio
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 16000
-      });
-      
-      // Create audio source from stream
-      const source = audioContext.createMediaStreamSource(stream);
-      
-      // Create processor to handle audio
-      const processor = audioContext.createScriptProcessor(512, 1, 1);
-      
-      processor.onaudioprocess = (e) => {
-        // Get raw audio data
-        const inputData = e.inputBuffer.getChannelData(0);
-        
-        // Convert to 16-bit PCM
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
-        }
-        
-        // Convert to base64 (browser-safe way)
-        const base64Data = arrayBufferToBase64(pcmData.buffer);
+  try {
+    // Get microphone access
+    audioStream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+    
+    // Create AudioContext for processing audio
+    const audioContext = new AudioContext({
+      sampleRate: 16000
+    });
+    
+    // Create a blob URL for the recorder worklet code
+    const blob = new Blob([audioRecorderProcessorCode], { type: 'application/javascript' });
+    const workletUrl = URL.createObjectURL(blob);
+    
+    // Register the worklet module
+    await audioContext.audioWorklet.addModule(workletUrl);
+    
+    // Create audio source from stream
+    const source = audioContext.createMediaStreamSource(audioStream);
+    
+    // Create the recorder worklet node
+    const recorderNode = new AudioWorkletNode(audioContext, 'audio-recorder-processor');
+    
+    // Connect source to recorder
+    source.connect(recorderNode);
+    recorderNode.connect(audioContext.destination);
+    
+    // Start recording
+    recorderNode.port.postMessage({
+      type: 'start-recording'
+    });
+    
+    // Listen for audio data from the worklet
+    recorderNode.port.onmessage = (event) => {
+      if (event.data.type === 'audio-data') {
+        // Convert the audio data to base64
+        const base64Data = arrayBufferToBase64(event.data.audioData);
         
         // Send to server
         if (subscription) {
@@ -347,32 +749,33 @@ function startRecording() {
             session_id: window.sessionId
           });
         }
-      };
-      
-      // Connect nodes
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-      
-      // Store references
-      recorder = {
-        audioContext: audioContext,
-        source: source,
-        processor: processor,
-        state: 'recording',
-        stop: function() {
-          this.state = 'inactive';
-          source.disconnect();
-          processor.disconnect();
-        }
-      };
-      
-      document.getElementById('startButton').disabled = true;
-      document.getElementById('stopButton').disabled = false;
-    })
-    .catch(error => {
-      console.error('Error accessing microphone:', error);
-      alert('Error accessing microphone. Please ensure you have granted microphone permissions.');
-    });
+      }
+    };
+    
+    // Store references
+    recorder = {
+      audioContext: audioContext,
+      source: source,
+      recorderNode: recorderNode,
+      state: 'recording',
+      stop: function() {
+        this.state = 'inactive';
+        // Tell the worklet to stop recording
+        this.recorderNode.port.postMessage({
+          type: 'stop-recording'
+        });
+        this.source.disconnect();
+        this.recorderNode.disconnect();
+        this.audioContext.close();
+      }
+    };
+    
+    document.getElementById('startButton').disabled = true;
+    document.getElementById('stopButton').disabled = false;
+  } catch (error) {
+    console.error('Error accessing microphone:', error);
+    alert('Error accessing microphone. Please ensure you have granted microphone permissions.');
+  }
 }
 
 function arrayBufferToBase64(buffer) {
@@ -404,90 +807,8 @@ function stopRecording() {
   }
 }
 
-// Function to create a WAV file from LPCM data
-function createWavFromLPCM(lpcmData, sampleRate, bitsPerSample, numChannels) {
-  // WAV header size
-  const headerSize = 44;
-  
-  // Create a new ArrayBuffer for the WAV file (header + data)
-  const wavBuffer = new ArrayBuffer(headerSize + lpcmData.length);
-  const view = new DataView(wavBuffer);
-  
-  // Write WAV header
-  // "RIFF" chunk descriptor
-  view.setUint8(0, 0x52); // 'R'
-  view.setUint8(1, 0x49); // 'I'
-  view.setUint8(2, 0x46); // 'F' 
-  view.setUint8(3, 0x46); // 'F'
-  
-  // Chunk size: 4 (WAVE) + 24 (fmt ) + 8 (data header) + data length
-  view.setUint32(4, 36 + lpcmData.length, true);
-  
-  // "WAVE" format
-  view.setUint8(8, 0x57);  // 'W'
-  view.setUint8(9, 0x41);  // 'A'
-  view.setUint8(10, 0x56); // 'V'
-  view.setUint8(11, 0x45); // 'E'
-  
-  // "fmt " sub-chunk
-  view.setUint8(12, 0x66); // 'f'
-  view.setUint8(13, 0x6D); // 'm'
-  view.setUint8(14, 0x74); // 't'
-  view.setUint8(15, 0x20); // ' '
-  
-  // Sub-chunk size (16 for PCM)
-  view.setUint32(16, 16, true);
-  
-  // Audio format (1 = PCM)
-  view.setUint16(20, 1, true);
-  
-  // Number of channels
-  view.setUint16(22, numChannels, true);
-  
-  // Sample rate
-  view.setUint32(24, sampleRate, true);
-  
-  // Byte rate: SampleRate * NumChannels * BitsPerSample/8
-  view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
-  
-  // Block align: NumChannels * BitsPerSample/8
-  view.setUint16(32, numChannels * (bitsPerSample / 8), true);
-  
-  // Bits per sample
-  view.setUint16(34, bitsPerSample, true);
-  
-  // "data" sub-chunk
-  view.setUint8(36, 0x64); // 'd'
-  view.setUint8(37, 0x61); // 'a'
-  view.setUint8(38, 0x74); // 't'
-  view.setUint8(39, 0x61); // 'a'
-  
-  // Data size (raw audio data size)
-  view.setUint32(40, lpcmData.length, true);
-  
-  // Copy audio data
-  const wavBytes = new Uint8Array(wavBuffer);
-  wavBytes.set(lpcmData, headerSize);
-  
-  // Additional check for 16-bit PCM
-  if (bitsPerSample === 16) {
-    // We may need to swap bytes for endianness if the audio is garbled
-    // If your audio sounds garbled, try uncommenting this code
-    
-    const dataView = new DataView(wavBuffer);
-    for (let i = 0; i < lpcmData.length / 2; i++) {
-      const offset = headerSize + i * 2;
-      const value = dataView.getInt16(offset, true); // Read as little endian
-      dataView.setInt16(offset, value, false); // Write as big endian
-    }
-    
-  }
-  
-  return wavBytes;
-}
-
 // Set up event listeners when the DOM is loaded
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   const startButton = document.getElementById('startButton');
   const stopButton = document.getElementById('stopButton');
 
@@ -496,4 +817,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Initialize connection
   connect();
+
+  // Initialize audio player
+  await initAudioPlayer();
 }); 

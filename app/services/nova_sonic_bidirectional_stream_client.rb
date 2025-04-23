@@ -24,7 +24,7 @@ class NovaSonicBidirectionalStreamClient
   
   DEFAULT_AUDIO_OUTPUT_CONFIGURATION = {
     mediaType: 'audio/lpcm',
-    sampleRateHertz: 16000,
+    sampleRateHertz: 24000,
     sampleSizeBits: 16,
     channelCount: 1,
     voiceId: 'en_us_tiffany',
