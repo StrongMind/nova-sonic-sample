@@ -105,7 +105,41 @@ class NovaSonicBidirectionalStreamClient
     # Stream audio for this session - simplified to match example.rb
     def stream_audio(audio_data)
       return unless @is_active
-      client.stream_audio_chunk(session_id, audio_data)
+      
+      begin
+        # Log audio characteristics for debugging
+        @logger.debug "StreamSession(#{session_id}): Streaming #{audio_data.bytesize} bytes of audio"
+        
+        # Ensure audio data meets basic requirements
+        if audio_data.nil? || audio_data.empty?
+          @logger.error "StreamSession(#{session_id}): Empty audio data"
+          raise "Empty audio data"
+        end
+        
+        # Verify the audio data is at least of minimal size
+        if audio_data.bytesize < 64
+          @logger.warn "StreamSession(#{session_id}): Audio data is very small (#{audio_data.bytesize} bytes), might not be valid"
+        end
+        
+        # Stream the audio
+        client.stream_audio_chunk(session_id, audio_data)
+      rescue => e
+        if e.message.include?("ValidationException") || e.message.include?("Invalid input")
+          @logger.error "StreamSession(#{session_id}): Validation error: #{e.message}"
+          # Mark session as inactive to prevent further attempts
+          @is_active = false
+          # Propagate the error for proper handling
+          raise e
+        elsif e.message.include?("Connection is closed")
+          @logger.error "StreamSession(#{session_id}): Connection closed: #{e.message}"
+          # Mark session as inactive
+          @is_active = false
+          raise e
+        else
+          @logger.error "StreamSession(#{session_id}): Error streaming audio: #{e.message}"
+          raise e
+        end
+      end
     end
     
     # Send content end
@@ -1161,12 +1195,20 @@ class NovaSonicBidirectionalStreamClient
     # Check if session exists and is active
     if !session_data || !session_data[:is_active]
       @logger.error "Session #{session_id} not found or inactive"
+      
+      # If a session ever existed but is now inactive, attempt to clean up any references
+      if @active_sessions.key?(session_id) && !session_data[:is_active]
+        @logger.info "Found inactive session #{session_id}, attempting cleanup"
+        force_close_session(session_id)
+      end
+      
       raise "Session not active or not found: #{session_id}"
     end
     
     # Verify we have an input stream available
     if !session_data[:input_stream]
       @logger.error "No input stream available for session #{session_id}"
+      session_data[:is_active] = false # Mark as inactive since it's in an invalid state
       raise "No input stream available for session: #{session_id}"
     end
     
@@ -1175,6 +1217,9 @@ class NovaSonicBidirectionalStreamClient
       @logger.error "Empty audio data received for session #{session_id}"
       raise "Empty audio data received"
     end
+    
+    # Update session activity timestamp
+    update_session_activity(session_id)
     
     # Convert audio to base64
     base64_data = Base64.strict_encode64(audio_data)
@@ -1195,20 +1240,26 @@ class NovaSonicBidirectionalStreamClient
       # Send directly to the input stream
       session_data[:input_stream].signal_chunk_event(bytes: audio_event)
     rescue => e
-      @logger.error "Failed to send audio chunk: #{e.message}"
+      error_message = e.message
+      @logger.error "Failed to send audio chunk: #{error_message}"
       
       # If connection is closed, mark session as inactive
-      if e.message.include?("Connection is closed")
-        @logger.error "Connection closed for session #{session_id}, marking as inactive"
+      if error_message.include?("Connection is closed") || 
+         error_message.include?("ValidationException") ||
+         error_message.include?("Bad Request")
+        @logger.error "Connection issue for session #{session_id}, marking as inactive"
         session_data[:is_active] = false
         dispatch_event_for_session(session_id, 'error', {
           source: 'connection',
-          error: "Connection closed: #{e.message}",
+          error: "Connection error: #{error_message}",
           recovery: "Please create a new session"
         })
+        
+        # Force cleanup after error
+        force_close_session(session_id)
       end
       
-      raise "Failed to send audio: #{e.message}"
+      raise "Failed to send audio: #{error_message}"
     end
   end
   
@@ -1413,7 +1464,7 @@ class NovaSonicBidirectionalStreamClient
   
   # Force close session
   def force_close_session(session_id)
-    return if is_cleanup_in_progress(session_id) || !@active_sessions.key?(session_id)
+    return if is_cleanup_in_progress(session_id) 
     
     @session_cleanup_in_progress.add(session_id)
     begin
@@ -1422,14 +1473,67 @@ class NovaSonicBidirectionalStreamClient
       
       @logger.info "Force closing session #{session_id}"
       
-      # Immediately mark as inactive and clean up resources
+      # Immediately mark as inactive
       session_data[:is_active] = false
-      # Set the close signal to notify waiting threads
-      session_data[:close_signal].set
+      
+      # Signal any waiting threads to stop waiting
+      session_data[:close_signal].set if session_data[:close_signal]
+      
+      # Try to close any open resources gracefully
+      if session_data[:input_stream]
+        begin
+          # Try to send a final contentEnd if applicable
+          if session_data[:audio_content_id]
+            content_end_event = {
+              "event": {
+                "contentEnd": {
+                  "promptName": session_data[:prompt_name],
+                  "contentName": session_data[:audio_content_id]
+                }
+              }
+            }.to_json
+            
+            begin
+              session_data[:input_stream].signal_chunk_event(bytes: content_end_event)
+              @logger.info "Sent final contentEnd event for session #{session_id}"
+            rescue => e
+              @logger.warn "Error sending final contentEnd: #{e.message}"
+            end
+          end
+          
+          # Try to send an explicit session end
+          session_end_event = {
+            "event": {
+              "sessionEnd": {}
+            }
+          }.to_json
+          
+          begin
+            session_data[:input_stream].signal_chunk_event(bytes: session_end_event)
+            @logger.info "Sent sessionEnd event for session #{session_id}"
+          rescue => e
+            @logger.warn "Error sending sessionEnd: #{e.message}"
+          end
+          
+          # Try to signal end of stream
+          begin
+            session_data[:input_stream].signal_end_stream
+            @logger.info "Signaled end of stream for session #{session_id}"
+          rescue => e
+            @logger.warn "Error signaling end of stream: #{e.message}"
+          end
+        rescue => e
+          @logger.error "Error during graceful stream shutdown: #{e.message}"
+        end
+      end
+      
+      # Clean up the session data
       @active_sessions.delete(session_id)
       @session_last_activity.delete(session_id)
       
-      @logger.info "Session #{session_id} force closed"
+      @logger.info "Session #{session_id} force closed and cleaned up"
+    rescue => e
+      @logger.error "Error during force_close_session: #{e.message}"
     ensure
       @session_cleanup_in_progress.delete(session_id)
     end

@@ -434,271 +434,283 @@ async function playAudio(float32AudioData) {
 }
 
 function connect() {
-  if (subscription) {
-    console.log("Cleaning up existing subscription");
-    subscription.unsubscribe();
+  // Reset reconnection counter if this is a manual connection
+  if (subscription === null) {
+    reconnectAttempts = 0;
   }
-
-  console.log("Attempting to connect with session ID:", window.sessionId);
+  
+  // Update UI to show connecting state
+  updateConnectionStatus("Connecting to Nova Sonic...", false);
+  
+  // Disable buttons while connecting
+  document.getElementById('startButton').disabled = true;
+  document.getElementById('stopButton').disabled = true;
+  
+  // Clean up existing subscription if any
+  if (subscription) {
+    console.log("Cleaning up existing subscription before reconnect");
+    subscription.unsubscribe();
+    subscription = null;
+  }
+  
+  // Create a new subscription with the session ID
+  console.log(`Creating subscription with session ID: ${window.sessionId}`);
   subscription = consumer.subscriptions.create(
-    {
-      channel: "AudioStreamChannel",
-      session_id: window.sessionId
-    },
+    { channel: "AudioStreamChannel", session_id: window.sessionId },
     {
       connected() {
         console.log("Connected to AudioStreamChannel");
-        reconnectAttempts = 0;
-        updateConnectionStatus('Connected', true);
+        reconnectAttempts = 0; // Reset counter on successful connection
       },
-
+      
       disconnected() {
         console.log("Disconnected from AudioStreamChannel");
-        updateConnectionStatus('Disconnected', false);
+        updateConnectionStatus("Disconnected", false);
         
-        if (recorder && recorder.state === 'recording') {
-          stopRecording();
-        }
-
-        // Handle reconnection
+        // Disable recording buttons
+        document.getElementById('startButton').disabled = true;
+        document.getElementById('stopButton').disabled = true;
+        
+        // Only try to reconnect if we haven't exceeded max attempts
         if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           reconnectAttempts++;
-          console.log(`Reconnection attempt ${reconnectAttempts} of ${MAX_RECONNECT_ATTEMPTS}`);
-          setTimeout(connect, 2000 * reconnectAttempts); // Exponential backoff
+          
+          // Exponential backoff for reconnection
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000); // Max 30-second delay
+          console.log(`Attempting to reconnect (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) in ${delay/1000} seconds...`);
+          
+          updateConnectionStatus(`Reconnecting in ${delay/1000} seconds... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, false);
+          
+          setTimeout(() => {
+            console.log(`Reconnecting now (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            connect();
+          }, delay);
         } else {
-          console.log("Max reconnection attempts reached");
-          updateConnectionStatus('Connection failed - please refresh the page', false);
+          console.log("Max reconnection attempts reached. Please refresh the page.");
+          updateConnectionStatus("Connection failed. Please refresh the page.", false);
+          appendMessage("Connection error: Maximum reconnection attempts reached. Please refresh the page to continue.");
         }
       },
-
+      
       rejected() {
         console.log("Subscription was rejected");
-        updateConnectionStatus('Connection rejected', false);
+        updateConnectionStatus("Connection rejected", false);
       },
-
+      
       async received(data) {
-        console.log("Received data:", data);
-        
-        // Handle subscription confirmation
-        if (data.type === 'confirm_subscription') {
-          console.log("Subscription confirmed with session ID:", data.sessionId);
-          document.getElementById('startButton').disabled = false;
-        }
-        
-        // Handle audio processing status
-        else if (data.type === 'audio_processing') {
-          console.log(`Processing ${data.size} bytes of audio data in ${data.format} format`);
-        }
-        
-        // Handle session recreation messages
-        else if (data.type === 'session_recreated' || data.type === 'session_recovered') {
-          console.log("Session status:", data.message);
-          // If recording is in progress, ensure we continue
-          if (recorder && recorder.state === 'recording') {
-            console.log("Continuing recording with new session");
-          } else {
-            console.log("Session is ready for new recording");
-            document.getElementById('startButton').disabled = false;
-            document.getElementById('stopButton').disabled = true;
-          }
-        }
-        
-        // Handle chunk events from Bedrock
-        else if (data.type === 'chunk') {
-          console.log("Received chunk data:", data);
-          
-          // Extract text content from chunk if available
-          if (data.data && data.data.event && data.data.event.textOutput) {
-            const textContent = data.data.event.textOutput.content;
-            if (textContent) {
-              const chatHistory = document.getElementById('chatHistory');
-              const messageDiv = document.createElement('div');
-              messageDiv.className = 'message assistant';
-              messageDiv.textContent = textContent;
-              chatHistory.appendChild(messageDiv);
-              chatHistory.scrollTop = chatHistory.scrollHeight;
+        try {
+          if (data.type === 'error') {
+            console.error(`Error from server:`, data);
+            
+            // Add error message to chat
+            let errorMsg = `Error: ${data.message}`;
+            if (data.details) {
+              errorMsg += ` - ${data.details}`;
             }
-          }
-        }
-        
-        // Handle text output from Bedrock model
-        else if (data.type === 'textOutput') {
-          console.log("Received text output:", data);
-          
-          // Handle both formats: direct content or nested event structure
-          let content = '';
-          let messageId = '';
-          
-          if (data.data && data.data.event && data.data.event.textOutput) {
-            content = data.data.event.textOutput.content;
-            // Try to get a message ID from the data
-            messageId = data.data.event.id || data.data.id || JSON.stringify(data.data.event.textOutput).substring(0, 100);
-          } else if (data.data && data.data.content) {
-            content = data.data.content;
-            messageId = data.data.id || JSON.stringify(data.data).substring(0, 100);
-          } else if (data.data) {
-            // If we can't find content in expected places, log the data and use stringified version
-            console.warn("Unexpected textOutput structure:", data.data);
-            content = JSON.stringify(data.data);
-            messageId = JSON.stringify(data.data).substring(0, 100);
-          }
-          
-          // Check if we've already processed this message to prevent duplicates
-          if (content && messageId) {
-            if (processedTextMessages.has(messageId)) {
-              console.log("Skipping duplicate text message:", messageId);
-              return;
-            }
+            appendMessage(errorMsg);
             
-            // Add to processed messages
-            processedTextMessages.add(messageId);
+            // Update connection status
+            updateConnectionStatus(`Error: ${data.message}`, false);
             
-            const chatHistory = document.getElementById('chatHistory');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'message assistant';
-            messageDiv.textContent = content;
-            chatHistory.appendChild(messageDiv);
-            chatHistory.scrollTop = chatHistory.scrollHeight;
-          }
-        }
-        
-        // Handle audio output from Bedrock model
-        else if (data.type === 'audioOutput') {
-          console.log("Received audio output data");
-          
-          // Get audio content, handling different possible structures
-          let audioContent = '';
-          let audioId = '';
-          
-          if (data.data && data.data.event && data.data.event.audioOutput) {
-            const audioOutput = data.data.event.audioOutput;
-            audioContent = audioOutput.content;
-            // Try to get an ID for deduplication
-            audioId = data.data.event.id || data.data.id || audioOutput.content.substring(0, 50);
-            
-            console.log("Audio configuration:", audioOutput.mediaType, 
-                      audioOutput.sampleRateHertz, 
-                      audioOutput.sampleSizeBits, 
-                      audioOutput.channelCount);
-          } else if (data.data && data.data.content) {
-            audioContent = data.data.content;
-            audioId = data.data.id || data.data.content.substring(0, 50);
-          } else if (data.data) {
-            console.warn("Unexpected audioOutput structure:", data.data);
-            console.log("Raw audioOutput data:", JSON.stringify(data));
-            return; // Can't process audio without proper content
-          }
-          
-          if (!audioContent) {
-            console.error("No audio content found in output");
-            return;
-          }
-          
-          // Check if we've already processed this audio to prevent duplicates
-          if (processedAudioMessages.has(audioId)) {
-            console.log("Skipping duplicate audio message:", audioId);
-            return;
-          }
-          
-          // Add to processed messages
-          processedAudioMessages.add(audioId);
-          
-          console.log(`Received audio content (length: ${audioContent.length})`);
-          
-          try {
-            // Convert base64 to audio data and play it
-            const audioData = base64ToFloat32Array(audioContent);
-            
-            if (audioData.length === 0) {
-              console.error("Converted audio data is empty");
-              return;
-            }
-            
-            // Ensure audio context is in running state
-            if (audioPlayer && audioPlayer.audioContext && audioPlayer.audioContext.state === 'suspended') {
-              console.log("Audio context is suspended, attempting to resume...");
-              try {
-                await audioPlayer.audioContext.resume();
-                console.log("Audio context resumed successfully");
-              } catch (err) {
-                console.error("Failed to resume audio context:", err);
+            // Handle specific error types
+            if (data.error_type) {
+              console.log(`Detected error type: ${data.error_type}`);
+              
+              // Credential issues
+              if (data.credential_status === 'issue') {
+                console.warn("AWS credential issue detected");
+                appendMessage("AWS credential issue detected. You may need to refresh your credentials.");
+              }
+              
+              // ValidationException errors
+              if (data.error_type === 'validation_exception' || data.error_type === 'invalid_input') {
+                console.warn("AWS validation error detected");
+                
+                // Stop current recording if active
+                if (recorder && recorder.state === 'recording') {
+                  await stopRecording();
+                  appendMessage("Recording stopped due to validation error");
+                }
+                
+                // Force audio player refresh
+                if (audioPlayer) {
+                  try {
+                    audioPlayer.stop();
+                    audioPlayer = null;
+                    await initAudioPlayer();
+                    console.log("Audio player reset after validation error");
+                  } catch (e) {
+                    console.error("Failed to reset audio player:", e);
+                  }
+                }
               }
             }
             
-            playAudio(audioData);
-          } catch (error) {
-            console.error("Error processing audio:", error, error.stack);
-          }
-        }
-        
-        // Handle errors
-        else if (data.type === 'error') {
-          console.error("Received error:", data.message, data.details);
-          
-          const chatHistory = document.getElementById('chatHistory');
-          const errorDiv = document.createElement('div');
-          errorDiv.className = 'message error';
-          errorDiv.textContent = `Error: ${data.message}`;
-          if (data.details) {
-            const detailsDiv = document.createElement('div');
-            detailsDiv.className = 'error-details';
-            detailsDiv.textContent = data.details;
-            errorDiv.appendChild(detailsDiv);
-          }
-          chatHistory.appendChild(errorDiv);
-          chatHistory.scrollTop = chatHistory.scrollHeight;
-          
-          // Handle specific validation errors that require reconnection
-          if (data.message.includes('session needs to be restarted') ||
-              data.message.includes('Failed to recreate session') ||
-              (data.details && (
-                data.details.includes('ValidationException') ||
-                data.details.includes('Connection is closed due to errors')
-              ))) {
-            console.log("Detected validation error, will attempt to reset session");
-            
-            // If we're currently recording, we need to restart
-            if (recorder && recorder.state === 'recording') {
-              console.log("Stopping current recording due to validation error");
-              stopRecording();
+            // Session not found case - attempt recovery
+            if (data.details && 
+                (data.details.includes('Session not found or inactive') || 
+                 data.details.includes('not active or not found'))) {
               
-              // Wait briefly then show a notification to restart
+              console.log("Session not found error detected, will try to recover automatically");
+              
+              // Stop current recording if active
+              if (recorder && recorder.state === 'recording') {
+                await stopRecording();
+              }
+              
+              // Wait a moment before reconnecting
               setTimeout(() => {
-                const chatHistory = document.getElementById('chatHistory');
-                const noticeDiv = document.createElement('div');
-                noticeDiv.className = 'message system';
-                noticeDiv.textContent = "Please try speaking again.";
-                chatHistory.appendChild(noticeDiv);
-                chatHistory.scrollTop = chatHistory.scrollHeight;
-                
-                // Re-enable the start button
-                document.getElementById('startButton').disabled = false;
-              }, 1000);
+                console.log("Attempting to reconnect after session not found error");
+                connect();
+              }, 1500);
             }
+            
+            // If server suggests a recovery action
+            if (data.recovery_action === 'refresh_page') {
+              console.log("Server suggests refreshing the page");
+              appendMessage("Connection error. Please refresh the page to reconnect.");
+              
+              // Disable buttons
+              document.getElementById('startButton').disabled = true;
+              document.getElementById('stopButton').disabled = true;
+            }
+            
+            return;
           }
-        }
-        
-        // Handle content end events
-        else if (data.type === 'contentEnd') {
-          console.log("Received contentEnd event:", data);
           
-          // If this is a complete turn (END_TURN), prepare for next interaction
-          if (data.data && 
-              data.data.event && 
-              data.data.event.contentEnd && 
-              data.data.event.contentEnd.stopReason === "END_TURN") {
-            console.log("End of turn detected, ready for next interaction");
+          // Handle session recovery messages
+          if (data.type === 'session_recovered' || data.type === 'session_recreated') {
+            console.log(`Session recovery status: ${data.message}`);
+            updateConnectionStatus(`Session recovered: ${data.message}`, true);
+            return;
           }
-        }
-        
-        // Handle any other messages for display
-        else if (data.message) {
-          console.log("Received message:", data.message);
-          appendMessage(data.message);
+          
+          // Handle connection confirmation
+          if (data.type === 'connected' || data.type === 'session_ready') {
+            console.log("Connection established with session ID:", data.session_id || window.sessionId);
+            updateConnectionStatus("Connected to Nova Sonic", true);
+            
+            // Enable start button
+            document.getElementById('startButton').disabled = false;
+            document.getElementById('stopButton').disabled = true;
+            
+            return;
+          }
+          
+          // Handle pong response
+          if (data.type === 'pong') {
+            console.log("Received pong from server:", data);
+            return;
+          }
+          
+          // Handle audio output
+          if (data.type === 'audioOutput') {
+            // Extract the audio content
+            try {
+              const audioData = data.data.event.audioOutput;
+              const audioContent = audioData.content;
+              
+              // Check if we have a non-empty content string
+              if (audioContent && typeof audioContent === 'string' && audioContent.trim().length > 0) {
+                const messageId = audioData.promptName + '_' + audioData.contentName;
+                
+                // Skip duplicates
+                if (processedAudioMessages.has(messageId)) {
+                  console.log(`Skipping duplicate audio message: ${messageId}`);
+                  return;
+                }
+                
+                processedAudioMessages.add(messageId);
+                
+                // Convert base64 audio to Float32Array and play it
+                const float32Samples = base64ToFloat32Array(audioContent);
+                if (float32Samples && float32Samples.length > 0) {
+                  await playAudio(float32Samples);
+                } else {
+                  console.warn("Received empty audio samples from base64 conversion");
+                }
+              } else {
+                console.log("Received empty audio content");
+              }
+            } catch (e) {
+              console.error("Error processing audio output:", e);
+            }
+            return;
+          }
+          
+          // Handle text output
+          if (data.type === 'textOutput') {
+            try {
+              const textData = data.data.event.textOutput;
+              const textContent = textData.content;
+              
+              const messageId = textData.promptName + '_' + textData.contentName;
+              
+              // Skip duplicates
+              if (processedTextMessages.has(messageId)) {
+                console.log(`Skipping duplicate text message: ${messageId}`);
+                return;
+              }
+              
+              processedTextMessages.add(messageId);
+              
+              if (textContent && textContent.trim().length > 0) {
+                // Add message to chat
+                appendMessage("Nova: " + textContent);
+              }
+            } catch (e) {
+              console.error("Error processing text output:", e);
+            }
+            return;
+          }
+          
+          // Handle tool use
+          if (data.type === 'toolUse') {
+            try {
+              const toolData = data.data.event.toolUse;
+              const toolName = toolData.toolName;
+              console.log(`Tool use request: ${toolName}`);
+              
+              // This is just a demo implementation - in a real app, you'd handle the tool
+              // based on its name and send tool results back
+              appendMessage(`[Tool] Nova wants to use: ${toolName}`);
+            } catch (e) {
+              console.error("Error processing tool use:", e);
+            }
+            return;
+          }
+          
+          // Handle content end (useful for UI markers)
+          if (data.type === 'contentEnd') {
+            try {
+              const contentData = data.data.event.contentEnd;
+              console.log(`Content end marker: ${contentData.contentName}`);
+            } catch (e) {
+              console.error("Error processing content end:", e);
+            }
+            return;
+          }
+          
+          // Handle all other message types (just log them)
+          console.log(`Received message of type ${data.type}:`, data);
+          
+        } catch (e) {
+          console.error("Error processing message:", e);
         }
       }
     }
   );
+  
+  // Send a ping to ensure connection is working
+  setTimeout(() => {
+    try {
+      if (subscription && subscription.send) {
+        subscription.send({type: 'ping', timestamp: Date.now()});
+      }
+    } catch (e) {
+      console.error("Error sending ping:", e);
+    }
+  }, 2000);
 }
 
 function updateConnectionStatus(message, isConnected) {
@@ -733,31 +745,33 @@ async function startRecording() {
   }
 
   try {
-    // Signal to the server we're starting a new audio stream
-    console.log("Sending audio_start event");
-    subscription.send({
-      type: 'audio_start',
-      session_id: window.sessionId
-    });
+    // Initialize audio configuration
+    const audioConfig = {
+      sampleRate: 16000,
+      channelCount: 1,
+      bitsPerSample: 16
+    };
+    
+    console.log(`Setting up audio capture with ${audioConfig.sampleRate}Hz, ${audioConfig.channelCount} channel, ${audioConfig.bitsPerSample}-bit`);
 
-    // Give a short delay for the server to initialize
-    await new Promise(resolve => setTimeout(resolve, 250));
-
-    // Get microphone access
+    // Get microphone access with explicit constraints
     audioStream = await navigator.mediaDevices.getUserMedia({ 
       audio: {
-        sampleRate: 16000,
-        channelCount: 1,
+        sampleRate: audioConfig.sampleRate,
+        channelCount: audioConfig.channelCount,
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true
       }
     });
     
-    // Create AudioContext for processing audio
+    // Create AudioContext with explicit sample rate
     const audioContext = new AudioContext({
-      sampleRate: 16000
+      sampleRate: audioConfig.sampleRate
     });
+    
+    // Check actual sample rate
+    console.log(`Actual AudioContext sample rate: ${audioContext.sampleRate}Hz`);
     
     // Create a blob URL for the recorder worklet code
     const blob = new Blob([audioRecorderProcessorCode], { type: 'application/javascript' });
@@ -776,6 +790,10 @@ async function startRecording() {
     source.connect(recorderNode);
     recorderNode.connect(audioContext.destination);
     
+    // Buffer to accumulate audio data
+    let audioBuffer = [];
+    const CHUNK_SIZE = 4000; // 0.125s at 16kHz, 16-bit
+    
     // Start recording
     recorderNode.port.postMessage({
       type: 'start-recording'
@@ -784,16 +802,31 @@ async function startRecording() {
     // Listen for audio data from the worklet
     recorderNode.port.onmessage = (event) => {
       if (event.data.type === 'audio-data') {
-        // Convert the audio data to base64
-        const base64Data = arrayBufferToBase64(event.data.audioData);
+        // Get the audio data as Int16Array
+        const audioData = new Int16Array(event.data.audioData);
         
-        // Send to server
-        if (subscription) {
-          subscription.send({
-            type: 'audio_input',
-            audio_data: base64Data,
-            session_id: window.sessionId
-          });
+        // Add to buffer
+        audioBuffer.push(...audioData);
+        
+        // When we have enough data, send a chunk
+        if (audioBuffer.length >= CHUNK_SIZE) {
+          // Create a chunk from the buffer
+          const chunk = new Int16Array(audioBuffer.slice(0, CHUNK_SIZE));
+          
+          // Convert to base64
+          const base64Data = arrayBufferToBase64(chunk.buffer);
+          
+          // Send to server
+          if (subscription) {
+            subscription.send({
+              type: 'audio_data',
+              audio: base64Data,
+              session_id: window.sessionId
+            });
+          }
+          
+          // Keep remaining data
+          audioBuffer = audioBuffer.slice(CHUNK_SIZE);
         }
       }
     };
@@ -804,12 +837,28 @@ async function startRecording() {
       source: source,
       recorderNode: recorderNode,
       state: 'recording',
+      audioBuffer: audioBuffer,
       stop: function() {
         this.state = 'inactive';
         // Tell the worklet to stop recording
         this.recorderNode.port.postMessage({
           type: 'stop-recording'
         });
+        
+        // Send any remaining audio in buffer
+        if (this.audioBuffer && this.audioBuffer.length > 0) {
+          const remainingChunk = new Int16Array(this.audioBuffer);
+          const base64Data = arrayBufferToBase64(remainingChunk.buffer);
+          
+          if (subscription) {
+            subscription.send({
+              type: 'audio_data',
+              audio: base64Data,
+              session_id: window.sessionId
+            });
+          }
+        }
+        
         this.source.disconnect();
         this.recorderNode.disconnect();
         this.audioContext.close();
