@@ -26,7 +26,7 @@ gem "solid_cable"
 gem "redis", "~> 5.0"
 
 # AWS SDK for Bedrock integration
-gem "aws-sdk-bedrockruntime", '~> 1.0'
+gem "aws-sdk-bedrockruntime", '~> 1.48'
 gem 'http-2' 
 
 # Reduces boot times through caching; required in config/boot.rb
