@@ -23,7 +23,7 @@ gem "tzinfo-data", platforms: %i[ windows jruby ]
 gem "solid_cache"
 gem "solid_queue"
 gem "solid_cable"
-gem "redis", "~> 5.0"
+gem "redis", "~> 5.4"
 
 # AWS SDK for Bedrock integration
 gem "aws-sdk-bedrockruntime", '~> 1.48'
